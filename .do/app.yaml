@@ -1,0 +1,62 @@
+name: phobs-automated-offers
+region: fra
+features:
+  - buildpack-stack=ubuntu-22
+
+services:
+  - name: web
+    dockerfile_path: Dockerfile
+    instance_size_slug: basic-xs
+    instance_count: 1
+    http_port: 8080
+    health_check:
+      http_path: /readyz
+      initial_delay_seconds: 10
+      period_seconds: 10
+      timeout_seconds: 3
+      failure_threshold: 3
+    routes:
+      - path: /
+    run_command: node dist/server.js
+    envs:
+      - { key: NODE_ENV, value: production }
+      - { key: PORT, value: '8080' }
+      - { key: PUBLIC_BASE_URL, scope: RUN_TIME, value: ${APP_URL} }
+      - { key: LOG_LEVEL, value: info }
+      - { key: DATABASE_URL, scope: RUN_TIME, value: ${db.DATABASE_URL} }
+      - { key: REDIS_URL, scope: RUN_TIME, value: ${redis.DATABASE_URL} }
+      - { key: TOKEN_VAULT_KEY, type: SECRET, scope: RUN_TIME }
+      - { key: TOKEN_VAULT_KEY_PREV, type: SECRET, scope: RUN_TIME }
+      - { key: SESSION_SECRET, type: SECRET, scope: RUN_TIME }
+      - { key: HUBSPOT_CLIENT_ID, type: SECRET, scope: RUN_TIME }
+      - { key: HUBSPOT_CLIENT_SECRET, type: SECRET, scope: RUN_TIME }
+      - { key: HUBSPOT_APP_ID, type: SECRET, scope: RUN_TIME }
+      - { key: HUBSPOT_REDIRECT_URI, scope: RUN_TIME }
+      - { key: HUBSPOT_SCOPES, scope: RUN_TIME }
+      - { key: ADMIN_IP_ALLOWLIST, scope: RUN_TIME }
+
+workers:
+  - name: worker
+    dockerfile_path: Dockerfile
+    instance_size_slug: basic-xs
+    instance_count: 1
+    run_command: node dist/worker.js
+    envs:
+      - { key: NODE_ENV, value: production }
+      - { key: LOG_LEVEL, value: info }
+      - { key: DATABASE_URL, scope: RUN_TIME, value: ${db.DATABASE_URL} }
+      - { key: REDIS_URL, scope: RUN_TIME, value: ${redis.DATABASE_URL} }
+      - { key: TOKEN_VAULT_KEY, type: SECRET, scope: RUN_TIME }
+      - { key: TOKEN_VAULT_KEY_PREV, type: SECRET, scope: RUN_TIME }
+      - { key: HUBSPOT_CLIENT_ID, type: SECRET, scope: RUN_TIME }
+      - { key: HUBSPOT_CLIENT_SECRET, type: SECRET, scope: RUN_TIME }
+
+databases:
+  - name: db
+    engine: PG
+    version: '16'
+    production: true
+  - name: redis
+    engine: REDIS
+    version: '7'
+    production: true

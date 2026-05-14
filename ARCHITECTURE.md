@@ -628,3 +628,105 @@ PHOBS_DEFAULT_ENDPOINT=https://...
 15. Alert rules (DO Alerts / Grafana) and runbook.
 16. `.do/app.yaml`, deploy to staging portal, end-to-end test on a real workflow.
 17. Production cutover + key-rotation drill.
+
+---
+
+## 14. Make.com feature parity checklist
+
+You're replacing a Make.com scenario (visible in the `{{1.x}}`, `{{formatDate(...)}}`, `{{if(...; ...; ...)}}` syntax in your XML template). To not regress on operability we should match these capabilities:
+
+### Must-have (will block daily operations without them)
+
+| Make.com feature                | Our equivalent                                          | Status      |
+| ------------------------------- | ------------------------------------------------------- | ----------- |
+| Execution history per scenario  | `audit_log` + Activity page in admin                    | planned     |
+| **Per-step input/output bundles** | Add `job_steps` table: row per pipeline step with input, output, status, duration | **NEW**     |
+| Replay an execution             | BullMQ "retry" from admin                               | planned     |
+| **Replay from a specific step** | Resumable job state already lets us start at step N; add admin button | **NEW**     |
+| **Manual / on-demand trigger**  | Admin form: enter a `hs_object_id` (or paste a JSON payload) → enqueue job. No HubSpot webhook needed. | **NEW**     |
+| Connections (OAuth, creds)      | `oauth_tokens`, `tenant_config` (Phobs creds)           | planned     |
+| **"Test connection" button**    | Per-tenant: HubSpot ping + Phobs availability probe → green/red. Surfaces auth issues before a real deal fails. | **NEW**     |
+| Error notifications             | Alerts (§8c) + admin badge per tenant                   | planned     |
+| Rate-limit awareness            | `callWithRetry` honours `Retry-After`; per-tenant queue concurrency cap | planned     |
+| Secrets / data stores           | Postgres (tenant_config) + Redis (caches)               | planned     |
+| Webhook queue with replay       | BullMQ + idempotency keys                               | planned     |
+
+### Should-have (saves you from re-implementing for every new tenant)
+
+| Make.com feature                 | Our equivalent                                                                                   | Status   |
+| -------------------------------- | ------------------------------------------------------------------------------------------------ | -------- |
+| **Error handler routes**         | Soft-failure branches: e.g. Phobs returns no `RatePlan` → send "no availability" email instead of erroring. Encode as part of the pipeline. | **NEW**  |
+| **Conditional skip / filter**    | Per-tenant rule: "skip if `dealstage != X`" or "skip if `numberOfAdults == 0`". Stored as a small DSL or JSON predicate. | **NEW**  |
+| **Formulas / expressions**       | Already need this for `donja/gornja`. Generalise to a tiny expression evaluator (e.g. `jsonata` or `expr-eval`) so non-engineers can tweak rules per tenant. | **NEW**  |
+| **Scheduled runs**               | Cron jobs (BullMQ repeatable jobs) — e.g. nightly "expire stale quotes", retry tenant whose token refreshes failed. | **NEW**  |
+| **Bundle inspector / data viewer** | Admin page: open a job, see each step's bundle (input/output JSON) with redactions. | **NEW**  |
+| **Test data / dry-run mode**     | Run the full pipeline against HubSpot **sandbox** portal or with `DRY_RUN=true` flag that skips writes but still calls Phobs. | **NEW**  |
+| **Operations counter / quota**   | `usage_log` table: count webhooks / Phobs calls / HubSpot calls per tenant per day. Useful for billing or quota alerts. | **NEW**  |
+| **Scenario versioning**          | Git for code; for per-tenant rule changes, keep `tenant_config_history` table with diffs. | **NEW**  |
+| **Sleep / delay**                | BullMQ `delay` option on enqueue.                                                                | planned  |
+| **Aggregator / Iterator**        | Native JS loops — no equivalent needed.                                                          | —        |
+| **Templates / shared modules**   | Code (TS modules).                                                                               | —        |
+
+### Nice-to-have (defer until asked)
+
+| Make.com feature                 | Note                                                                                          |
+| -------------------------------- | --------------------------------------------------------------------------------------------- |
+| Visual flow editor               | Out of scope; pipeline is in code. We'll render a static read-only flowchart in admin instead. |
+| Marketplace of pre-built apps    | Out of scope.                                                                                 |
+| Webhook URL rotation             | Per-tenant unguessable webhook URL token (e.g. `/webhooks/hubspot/:portalId/:secretToken`) so revealing the URL alone is not enough. Add if customer asks. |
+| Slack / Teams notifications      | Hook DO Alerts → Slack webhook. 30-min job.                                                   |
+| Multi-region failover            | DO App Platform single-region is fine for v1. Postgres PITR covers DR.                        |
+
+### New DB tables introduced by this section
+
+```sql
+-- Per-step execution record (powers the bundle inspector + replay-from-step)
+job_steps(
+  id              bigserial primary key,
+  job_id          text not null,            -- BullMQ job id
+  hub_id          bigint not null,
+  deal_id         bigint,
+  step            text not null,            -- 'normalize_ages' | 'hubdb_query' | 'phobs_avail' | ...
+  step_index      smallint not null,
+  status          text not null,            -- 'ok' | 'skipped' | 'error' | 'retrying'
+  input           jsonb,
+  output          jsonb,
+  error           text,
+  duration_ms     integer,
+  created_at      timestamptz not null default now()
+)
+create index on job_steps(job_id);
+create index on job_steps(hub_id, created_at desc);
+
+-- Per-tenant version history of config changes
+tenant_config_history(
+  id              bigserial primary key,
+  hub_id          bigint not null,
+  admin_user_id   bigint not null,
+  before          jsonb not null,
+  after           jsonb not null,
+  changed_at      timestamptz not null default now()
+)
+
+-- Daily usage rollup (for quota / billing visibility)
+usage_daily(
+  hub_id          bigint not null,
+  day             date not null,
+  webhooks        integer not null default 0,
+  phobs_calls     integer not null default 0,
+  hubspot_calls   integer not null default 0,
+  quotes_created  integer not null default 0,
+  emails_sent     integer not null default 0,
+  primary key (hub_id, day)
+)
+```
+
+### Updated admin UI pages (additions to §8b)
+
+- **Manual run** page — `hs_object_id` input or paste-JSON-payload, "dry run" toggle, fire button → links to the resulting job.
+- **Job detail** page — step-by-step bundle inspector, "replay" and "replay from step N" buttons.
+- **Connections** page (per tenant) — "Test HubSpot" and "Test Phobs" buttons with last-success timestamps.
+- **Rules** page (per tenant) — visual editor for filter predicate + per-property `donja/gornja` table + access-code rule, with history (uses `tenant_config_history`).
+- **Usage** page — chart of daily usage per tenant.
+
+---

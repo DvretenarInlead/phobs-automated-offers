@@ -677,6 +677,11 @@ You're replacing a Make.com scenario (visible in the `{{1.x}}`, `{{formatDate(..
 | Slack / Teams notifications      | Hook DO Alerts → Slack webhook. 30-min job.                                                   |
 | Multi-region failover            | DO App Platform single-region is fine for v1. Postgres PITR covers DR.                        |
 
+### Locked decisions
+
+- **Rule engine: JSON config only.** No DSL, no scripting. The admin UI exposes a typed form (per-property `donja/gornja` table, dealstage allow-list, toggles). Keeps the security surface small and onboarding fast.
+- **No availability: silent.** If Phobs returns zero rate plans, set deal property `phobs_availability_status='no_availability'` and exit the job cleanly. No email is sent. No alert is raised (it's a normal business outcome, not an error). Sales handles it manually.
+
 ### New DB tables introduced by this section
 
 ```sql

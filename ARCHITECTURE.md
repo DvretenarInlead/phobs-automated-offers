@@ -169,19 +169,24 @@ oauth_tokens(
   updated_at            timestamptz not null default now()
 )
 
--- Per-tenant operational config (editable via admin UI later)
+-- Per-tenant operational config (editable via admin UI)
 tenant_config(
   hub_id              bigint primary key references tenants(hub_id) on delete cascade,
-  phobs_auth_user_ct  bytea, phobs_auth_user_iv bytea, phobs_auth_user_tag bytea,
-  phobs_auth_pass_ct  bytea, phobs_auth_pass_iv bytea, phobs_auth_pass_tag bytea,
   phobs_endpoint      text not null,
-  hubdb_table_id      text not null,           -- "which ID will I want to modify in the UI"
+  phobs_site_id       text not null,           -- plaintext, not sensitive
+  phobs_auth_user_ct  bytea not null, phobs_auth_user_iv bytea not null, phobs_auth_user_tag bytea not null,
+  phobs_auth_pass_ct  bytea not null, phobs_auth_pass_iv bytea not null, phobs_auth_pass_tag bytea not null,
+  hubdb_table_id      text not null,
+  hubdb_column_map    jsonb not null default '{}'::jsonb,
+                       -- { "unit_id_column": "...", "property_id_column": "...", ... }
   quote_template_id   text not null,
   owner_id            bigint not null,
   access_code         text,                    -- loyalty access code, optional
-  email_template_id   text not null,           -- transactional email
   property_rules      jsonb not null default '{}'::jsonb,
                        -- { "<propertyId>": {name, donja, gornja} }
+  rate_filters        jsonb not null default '{}'::jsonb,
+                       -- see §14 Rate filtering rules
+  trigger_mode        text not null default 'webhook',  -- 'webhook' | 'workflow_extension'
   updated_at          timestamptz not null default now()
 )
 
@@ -304,13 +309,25 @@ Handler:
 
 ### 8.2 Webhook ingestion
 
+Two entry routes, two verifiers, one downstream pipeline:
+
+**Route A — `/webhooks/hubspot/:portalId` (workflow "Send a webhook" action)**
 - **HMAC v3** verification on every request, before any parsing logic.
 - Raw body captured via Fastify content-type parser; HMAC computed over raw bytes, never the re-serialised JSON.
 - Header `X-HubSpot-Request-Timestamp` checked against `Date.now()` — reject if >5 min skew.
 - `crypto.timingSafeEqual` for signature comparison.
+
+**Route B — `/workflow-actions/process-deal` (workflow extension)**
+- HubSpot invokes the custom workflow action with an `Authorization: Bearer <JWT>` header.
+- JWT is signed by HubSpot using the app's keys; verify with the published JWKS for the HubSpot app (cache JWKS in Redis with TTL = 1h, refresh on `kid` miss).
+- Claims required: `iss == "https://api.hubspot.com"`, `aud == HUBSPOT_APP_ID`, valid `exp`, `hub_id` claim used to look up the tenant.
+- No HMAC body check needed — the JWT covers integrity of the call. Still validate body schema with `zod`.
+
+**Both routes** then share:
 - Per-tenant sliding-window rate limit in Redis (e.g. 100 req/min, configurable).
 - Idempotency keys: `sha256(portalId|hs_object_id|sha256(rawBody))`, 7-day TTL, `INSERT … ON CONFLICT DO NOTHING`.
-- 400 on schema mismatch, 401 on signature mismatch, 200 on duplicate, 200 on accepted — never 5xx for invalid input (avoids HubSpot retries on permanent failures).
+- 400 on schema mismatch, 401 on signature/JWT failure, 200 on duplicate, 200 on accepted — never 5xx for invalid input (avoids HubSpot retries on permanent failures).
+- Same `enqueue(processDeal, { portalId, payload, source: 'webhook' | 'extension' })` handoff.
 
 ### 8.3 Secrets at rest
 
@@ -379,12 +396,11 @@ Handler:
 9. **Settings → users** (superadmin only) — invite admin users, set roles, reset MFA, deactivate.
 10. **Settings → keys** (superadmin only) — view (masked), regenerate token-vault key with progress bar (re-encrypt job).
 
-### Roles
-- `superadmin` — everything, can manage other admins and rotate keys.
-- `admin` — manage all tenants, view all logs.
-- `tenant_admin` (future) — scoped to a single `hub_id`; for end-customer hotel staff to edit their own `property_rules` only.
+### Roles (locked)
+- `superadmin` — you. Manages everything across all tenants, rotates keys, invites tenant_admins, sees all live monitoring streams.
+- `tenant_admin` — exactly one user per portal. Scoped to a single `hub_id`. Can view & edit their own tenant config (HubDB mapping, property rules, rate filters, Phobs creds via masked write-only inputs), see their own jobs, audit log, and live monitoring streams. Cannot see other tenants, cannot manage users, cannot rotate keys.
 
-Role enforcement is centralised in a `requireRole(role[, hubId])` Fastify hook used on every `/api/admin/*` route.
+Role enforcement is centralised in a `requireRole(role[, hubId])` Fastify hook used on every `/api/admin/*` route. The hook reads `req.session.user`, checks role, and for `tenant_admin` asserts `session.user.scoped_hub_id === params.hubId`.
 
 ### Auth flow
 - **Argon2id** password hashing (`memoryCost: 19456, timeCost: 2, parallelism: 1`).
@@ -685,6 +701,22 @@ You're replacing a Make.com scenario (visible in the `{{1.x}}`, `{{formatDate(..
 - **Phobs credential storage: Postgres token vault** (AES-256-GCM, master key in DO encrypted env). Bitwarden Secrets Manager rejected for v1 — marginal threat-model improvement, extra vendor + latency + cost. Migration path remains open via the `tokenVault.ts` abstraction.
 - **Email sending: deal property update → HubSpot workflow sends email.** We do NOT call the HubSpot Single-Send Transactional API. Instead `processDeal` writes `quote_link_custom`, `quote_id`, `number_of_childrens`, `phobs_availability_status` (and language token if needed) to the deal; a HubSpot workflow listens on those properties and fires the correct email template per language. No transactional email add-on required, marketing team owns the content. Single-Send remains available as escape hatch if a future case needs it.
 - **Rate filtering per unit.** Some tenants want to exclude certain rate plans from offers (e.g. unit `17173` should only present BB rates, never HB; or always exclude any `RateId` matching `RATE52580*`). Stored under `tenant_config.rate_filters` JSONB as a typed rule set, editable in the admin UI — no code.
+- **Trigger style: both supported.**
+  1. **Phase 1 — "Send a webhook" workflow action** with HubSpot Signature v3 validation. Tenants paste a per-portal URL (`/webhooks/hubspot/:portalId`) into a HubSpot workflow's webhook action. Fastest to ship; the existing inputFields payload shape is preserved.
+  2. **Phase 2 — HubSpot Workflow Extension** (custom workflow action registered by our Public App). After install, the action "Phobs Automated Offer" appears in the customer's workflow builder with typed input fields. HubSpot invokes it with a **signed JWT in the `Authorization` header** (different from HMAC v3 — we add a JWT verifier alongside the HMAC verifier, keyed on the same HubSpot client secret / app keys).
+  Both paths converge on the same `processDeal` job — only the route handler and signature verifier differ.
+- **Admin auth model: superadmin + one `tenant_admin` per portal.** Two roles only, no `admin` middle tier. Superadmin (you) manages everything; each tenant gets exactly one `tenant_admin` user scoped to their `hub_id` who can view & edit their own config, see their own logs/jobs/live monitoring, and nothing else. The `admin` role in §8b is dropped from v1.
+- **Phobs `<Auth>` shape: `SiteId` + `Username` + `Password`.** The admin UI exposes three inputs per tenant: `phobs_site_id` (plaintext — not sensitive), `phobs_auth_user` (vaulted), `phobs_auth_pass` (vaulted, write-only field). XML builder emits:
+
+  ```xml
+  <Auth>
+    <SiteId>{site_id}</SiteId>
+    <Username>{username}</Username>
+    <Password>{password}</Password>
+  </Auth>
+  ```
+
+  All three are required per tenant; the "Test Phobs" button in admin fires a minimal `PCPropertyAvailabilityRQ` to confirm credentials before saving.
 
 ### Rate filtering rules
 

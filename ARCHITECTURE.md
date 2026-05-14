@@ -681,6 +681,69 @@ You're replacing a Make.com scenario (visible in the `{{1.x}}`, `{{formatDate(..
 
 - **Rule engine: JSON config only.** No DSL, no scripting. The admin UI exposes a typed form (per-property `donja/gornja` table, dealstage allow-list, toggles). Keeps the security surface small and onboarding fast.
 - **No availability: silent.** If Phobs returns zero rate plans, set deal property `phobs_availability_status='no_availability'` and exit the job cleanly. No email is sent. No alert is raised (it's a normal business outcome, not an error). Sales handles it manually.
+- **HubDB mapping defined in admin UI.** No hardcoded column names. On tenant setup, we GET the HubDB table schema once, present the columns in the UI, and let the admin map: "which column holds `unitId`?", "which holds `propertyId`?". Mapping stored in `tenant_config.hubdb_column_map` JSONB.
+- **Phobs credential storage: Postgres token vault** (AES-256-GCM, master key in DO encrypted env). Bitwarden Secrets Manager rejected for v1 — marginal threat-model improvement, extra vendor + latency + cost. Migration path remains open via the `tokenVault.ts` abstraction.
+- **Email sending: deal property update → HubSpot workflow sends email.** We do NOT call the HubSpot Single-Send Transactional API. Instead `processDeal` writes `quote_link_custom`, `quote_id`, `number_of_childrens`, `phobs_availability_status` (and language token if needed) to the deal; a HubSpot workflow listens on those properties and fires the correct email template per language. No transactional email add-on required, marketing team owns the content. Single-Send remains available as escape hatch if a future case needs it.
+- **Rate filtering per unit.** Some tenants want to exclude certain rate plans from offers (e.g. unit `17173` should only present BB rates, never HB; or always exclude any `RateId` matching `RATE52580*`). Stored under `tenant_config.rate_filters` JSONB as a typed rule set, editable in the admin UI — no code.
+
+### Rate filtering rules
+
+Per-tenant, per-unit (and/or global) filter applied **after parsing the Phobs response, before creating products and line items**:
+
+```jsonc
+// tenant_config.rate_filters
+{
+  "global": {
+    "exclude_rate_ids": ["RATE525800"],         // never offer these, any unit
+    "exclude_boards": [],                       // e.g. ["FB"]
+    "include_boards": null,                     // null = no allow-list
+    "min_available_units": 1,
+    "max_price_per_night": null
+  },
+  "units": {
+    "17173": {
+      "include_boards": ["BB"],                 // this unit: BB only
+      "exclude_rate_ids": [],
+      "max_results": 2                          // keep at most N cheapest rates
+    },
+    "17180": {
+      "exclude_boards": ["HB"]
+    }
+  }
+}
+```
+
+Engine rules (in order):
+1. Drop units with `AvailableUnits < global.min_available_units`.
+2. For each unit, drop rate plans whose `RateId` is in `global.exclude_rate_ids` ∪ `units[unitId].exclude_rate_ids`.
+3. Drop rate plans whose `Board` is in any `exclude_boards`, or not in `include_boards` if set.
+4. Drop rate plans with `Price > max_price_per_night` if set.
+5. Sort remaining by price ascending; truncate to `max_results` if set.
+6. If a unit has zero rate plans left after filtering, drop the unit.
+7. If everything is filtered out → treat as `no_availability` (silent, per locked decision above).
+
+Admin UI exposes this as a typed form: dropdowns for boards, text inputs for rate ID patterns (exact match only — no regex, to avoid ReDoS), number inputs. Changes audited via `tenant_config_history`.
+
+### 14.x Live monitoring
+
+In addition to the persisted `audit_log` + Prometheus metrics, the admin UI provides **streaming live views** (SSE over the same Fastify origin, session-auth-gated):
+
+| View                    | Stream source                                     | Use case                                                              |
+| ----------------------- | ------------------------------------------------- | --------------------------------------------------------------------- |
+| **Incoming webhooks**   | Redis pub/sub channel `live:webhooks:<hub_id>`    | Tail signed/duplicate/accepted decisions in real time during a sales demo or customer call |
+| **Job activity**        | BullMQ events (`active`, `progress`, `completed`, `failed`) | Watch a deal flow through the pipeline step by step                  |
+| **External API calls**  | Redis pub/sub `live:ext:<hub_id>` (HubSpot + Phobs reqs/resps, redacted) | See exactly what we sent to Phobs and what came back, without grepping logs |
+| **Filter trace**        | Per-job: which rate plans dropped at which rule  | Debug "why didn't unit X appear in the quote?"                       |
+| **Live tenant health**  | Prometheus query polled every 5s                  | Per-tenant counters (last 60s): webhooks, jobs ok, jobs failed, p95 Phobs latency |
+
+Implementation:
+- Each step in the worker pipeline calls `liveEmit(hubId, channel, event)` which `PUBLISH`es a JSON event to Redis with TTL hints. The web service holds an open SSE connection per admin viewer, subscribed to the channels they're authorised for.
+- Events are best-effort (Redis pub/sub is fire-and-forget) — the **canonical record stays in `audit_log` / `job_steps`** so viewers who arrive late can replay the last N events from DB then upgrade to live.
+- Backpressure: cap each SSE connection at 500 events/s; drop with a `meta:overflow` marker if exceeded.
+- Secrets/PII redacted at emit time using the same pino redaction list. No raw OAuth tokens or guest birthdates ever hit the stream.
+- Auth: admin session cookie required; `tenant_admin` role sees only its own `hub_id`; superadmin sees all.
+
+This is the closest analogue to Make.com's "running scenario" view — and arguably better, since it spans the queue + external calls + filter decisions in one timeline.
 
 ### New DB tables introduced by this section
 

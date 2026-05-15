@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import cookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import rawBody from 'fastify-raw-body';
@@ -9,9 +10,14 @@ import { registerRequestId } from './lib/requestId.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerWebhookRoutes } from './routes/webhook.js';
 import { registerOAuthRoutes } from './routes/oauth.js';
+import { registerAdminAuthRoutes } from './routes/adminAuth.js';
+import { registerAdminApiRoutes } from './routes/adminApi.js';
+import { registerAdminAuthHook } from './admin/auth.js';
+import { registerMetricsRoute, httpRequestDuration, httpRequestsTotal } from './metrics/index.js';
 import { makeRedis } from './queue/index.js';
 
 const config = loadConfig();
+const ADMIN_API_PREFIX = '/api/admin';
 
 async function buildApp() {
   const app = Fastify({
@@ -27,10 +33,12 @@ async function buildApp() {
       },
     },
     trustProxy: true,
-    bodyLimit: 1_000_000, // 1 MB cap on webhook payloads
+    bodyLimit: 1_000_000,
     disableRequestLogging: false,
     genReqId: () => randomUUID(),
   });
+
+  await app.register(cookie, { hook: 'onRequest' });
 
   await app.register(helmet, {
     contentSecurityPolicy: {
@@ -58,13 +66,28 @@ async function buildApp() {
     field: 'rawBody',
     global: false,
     runFirst: true,
-    encoding: false, // store as Buffer
+    encoding: false,
   });
 
   registerRequestId(app);
+
+  // Metric middleware — observes every request.
+  app.addHook('onResponse', (req, reply, done) => {
+    const route = req.routeOptions?.url ?? req.url.split('?')[0] ?? 'unknown';
+    httpRequestsTotal.labels(route, req.method, String(reply.statusCode)).inc();
+    httpRequestDuration.labels(route, req.method).observe(reply.elapsedTime / 1000);
+    done();
+  });
+
+  // Admin auth hook runs first for /api/admin/* (skips /login + /csrf).
+  registerAdminAuthHook(app, ADMIN_API_PREFIX);
+
   registerHealthRoutes(app);
+  registerMetricsRoute(app);
   registerWebhookRoutes(app);
   registerOAuthRoutes(app);
+  registerAdminAuthRoutes(app, ADMIN_API_PREFIX);
+  registerAdminApiRoutes(app, ADMIN_API_PREFIX);
 
   app.setErrorHandler((err: Error & { statusCode?: number }, req, reply) => {
     req.log.error({ err }, 'request failed');

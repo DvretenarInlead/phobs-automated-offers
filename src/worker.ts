@@ -1,11 +1,16 @@
 import { makeWorker } from './queue/index.js';
+import { processDealJob } from './queue/jobs/processDeal.js';
 import { logger } from './lib/logger.js';
 
-const worker = makeWorker((job) => {
-  logger.info({ jobId: job.id, name: job.name, attempt: job.attemptsMade + 1 }, 'job received');
-  // Pipeline implementation lands in src/queue/jobs/processDeal.ts next.
-  // For now we acknowledge so the queue plumbing can be exercised end-to-end.
-  return Promise.resolve({ acknowledged: true });
+const worker = makeWorker(async (job) => {
+  logger.info(
+    { jobId: job.id, name: job.name, attempt: job.attemptsMade + 1 },
+    'job received',
+  );
+  if (job.name === 'processDeal') {
+    return processDealJob(job as Parameters<typeof processDealJob>[0]);
+  }
+  throw new Error(`unknown job: ${job.name}`);
 });
 
 async function shutdown(signal: string) {

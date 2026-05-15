@@ -35,6 +35,14 @@ const COOKIE_BASE = {
   sameSite: 'strict' as const,
 };
 
+// CSRF cookie must be readable by the SPA (it echoes the value in the header).
+const COOKIE_CSRF = {
+  path: '/',
+  httpOnly: false,
+  secure: true,
+  sameSite: 'strict' as const,
+};
+
 const loginSchema = z.object({
   email: z.string().email().toLowerCase().max(256),
   password: z.string().min(1).max(256),
@@ -46,7 +54,7 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
   app.get(`${prefix}/csrf`, (_req, reply) => {
     const token = issueCsrfToken();
     void reply
-      .setCookie(csrfCookieName, token, { ...COOKIE_BASE, maxAge: 60 * 60 * 24 })
+      .setCookie(csrfCookieName, token, { ...COOKIE_CSRF, maxAge: 60 * 60 * 24 })
       .send({ csrfToken: token, headerName: csrfHeaderName });
   });
 
@@ -138,7 +146,7 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
         ...COOKIE_BASE,
         maxAge: Math.floor((session.expiresAt.getTime() - Date.now()) / 1000),
       })
-      .setCookie(csrfCookieName, csrf, { ...COOKIE_BASE, maxAge: 60 * 60 * 24 })
+      .setCookie(csrfCookieName, csrf, { ...COOKIE_CSRF, maxAge: 60 * 60 * 24 })
       .send({
         ok: true,
         user: {

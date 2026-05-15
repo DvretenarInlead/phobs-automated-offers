@@ -2,8 +2,12 @@ import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
+import staticPlugin from '@fastify/static';
 import rawBody from 'fastify-raw-body';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
 import { loadConfig } from './config.js';
 import { logger } from './lib/logger.js';
 import { registerRequestId } from './lib/requestId.js';
@@ -92,6 +96,32 @@ async function buildApp() {
   registerAdminUserRoutes(app, ADMIN_API_PREFIX);
   registerAdminApiRoutes(app, ADMIN_API_PREFIX);
   registerAdminLiveRoutes(app, ADMIN_API_PREFIX);
+
+  // ---- Admin SPA static files ----
+  // Built by `vite build` to dist/admin/. We serve them at /admin/ with an
+  // HTML5 history fallback so client-side routing works for deep links.
+  const __filename = fileURLToPath(import.meta.url);
+  const adminRoot = resolve(dirname(__filename), '..', 'dist', 'admin');
+  if (existsSync(adminRoot)) {
+    await app.register(staticPlugin, {
+      root: adminRoot,
+      prefix: '/admin/',
+      decorateReply: false,
+      wildcard: false,
+    });
+    // Fallback: any /admin/* path that didn't match a real file → serve index.html.
+    app.setNotFoundHandler((req, reply) => {
+      if (req.url.startsWith('/admin/') && req.method === 'GET') {
+        return reply.sendFile('index.html', join(adminRoot));
+      }
+      return reply.code(404).send({ error: 'not_found' });
+    });
+  } else {
+    logger.warn(
+      { adminRoot },
+      'admin SPA bundle not found — run `npm run build:ui` to enable /admin/',
+    );
+  }
 
   app.setErrorHandler((err: Error & { statusCode?: number }, req, reply) => {
     req.log.error({ err }, 'request failed');

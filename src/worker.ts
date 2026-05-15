@@ -1,5 +1,6 @@
-import { makeWorker } from './queue/index.js';
+import { makeWorker, scheduleDailyRollup } from './queue/index.js';
 import { processDealJob } from './queue/jobs/processDeal.js';
+import { rollupUsageJob } from './queue/jobs/rollupUsage.js';
 import { logger } from './lib/logger.js';
 
 const worker = makeWorker(async (job) => {
@@ -7,10 +8,19 @@ const worker = makeWorker(async (job) => {
     { jobId: job.id, name: job.name, attempt: job.attemptsMade + 1 },
     'job received',
   );
-  if (job.name === 'processDeal') {
-    return processDealJob(job as Parameters<typeof processDealJob>[0]);
+  switch (job.name) {
+    case 'processDeal':
+      return processDealJob(job as Parameters<typeof processDealJob>[0]);
+    case 'rollupUsage':
+      return rollupUsageJob(job);
+    default:
+      throw new Error(`unknown job: ${job.name}`);
   }
-  throw new Error(`unknown job: ${job.name}`);
+});
+
+// Ensure the daily rollup is scheduled. Safe to call repeatedly.
+scheduleDailyRollup().catch((err: unknown) => {
+  logger.warn({ err }, 'failed to schedule daily rollup');
 });
 
 async function shutdown(signal: string) {

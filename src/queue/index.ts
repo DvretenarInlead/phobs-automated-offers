@@ -47,6 +47,23 @@ export async function enqueueProcessDeal(
   return job.id;
 }
 
+/**
+ * Schedule the daily usage rollup once per day at 03:10 UTC. Idempotent — calling
+ * this multiple times replaces the schedule (BullMQ dedupes by jobId).
+ */
+export async function scheduleDailyRollup(): Promise<void> {
+  await getQueue().add(
+    'rollupUsage',
+    {},
+    {
+      repeat: { pattern: '10 3 * * *', tz: 'UTC' },
+      jobId: 'rollupUsage:daily',
+      removeOnComplete: { age: 7 * 86_400, count: 30 },
+      removeOnFail: 30,
+    },
+  );
+}
+
 export function makeWorker(processor: Processor): Worker {
   const worker = new Worker(QUEUE_NAME, processor, {
     connection: makeRedis(),

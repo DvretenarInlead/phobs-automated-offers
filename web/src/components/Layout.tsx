@@ -3,11 +3,16 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
 import { logout } from '../lib/api';
 
-const navItems = [
+const navBase = [
   { to: '/', label: 'Dashboard' },
   { to: '/tenants', label: 'Tenants' },
+  { to: '/activity', label: 'Activity' },
+  { to: '/live', label: 'Live' },
+  { to: '/jobs', label: 'Jobs' },
   { to: '/probe', label: 'Phobs probe' },
+  { to: '/settings', label: 'Settings' },
 ];
+const navSuperadmin = [{ to: '/users', label: 'Users' }];
 
 export function Layout(): ReactElement {
   const { user, setUser } = useAuth();
@@ -27,7 +32,7 @@ export function Layout(): ReactElement {
           <div className="text-xs text-slate-500 mt-0.5">Admin</div>
         </div>
         <nav className="flex-1 p-2 space-y-1">
-          {navItems.map((n) => (
+          {[...navBase, ...(user?.role === 'superadmin' ? navSuperadmin : [])].map((n) => (
             <NavLink
               key={n.to}
               to={n.to}

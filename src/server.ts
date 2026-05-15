@@ -18,6 +18,7 @@ import { registerAdminAuthRoutes } from './routes/adminAuth.js';
 import { registerAdminApiRoutes } from './routes/adminApi.js';
 import { registerAdminUserRoutes } from './routes/adminUsers.js';
 import { registerAdminLiveRoutes } from './routes/adminLive.js';
+import { registerAdminJobsRoutes } from './routes/adminJobs.js';
 import { registerAdminAuthHook } from './admin/auth.js';
 import { registerMetricsRoute, httpRequestDuration, httpRequestsTotal } from './metrics/index.js';
 import { makeRedis } from './queue/index.js';
@@ -95,6 +96,7 @@ async function buildApp() {
   registerAdminAuthRoutes(app, ADMIN_API_PREFIX);
   registerAdminUserRoutes(app, ADMIN_API_PREFIX);
   registerAdminApiRoutes(app, ADMIN_API_PREFIX);
+  registerAdminJobsRoutes(app, ADMIN_API_PREFIX);
   registerAdminLiveRoutes(app, ADMIN_API_PREFIX);
 
   // ---- Admin SPA static files ----

@@ -1,6 +1,11 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { ExternalServiceError } from './errors.js';
 import { logger } from './logger.js';
+import {
+  externalApiCalls,
+  externalApiDuration,
+  externalApiRetries,
+} from '../metrics/index.js';
 
 export interface RetryOpts {
   maxAttempts?: number;
@@ -40,15 +45,23 @@ export async function callWithRetry<T>(
     const start = Date.now();
     try {
       const result = await fn();
+      const latencyMs = Date.now() - start;
+      externalApiDuration.labels(target, op).observe(latencyMs / 1000);
+      externalApiCalls.labels(target, op, '2xx').inc();
       if (attempt > 1) {
-        logger.info({ target, op, attempt, latencyMs: Date.now() - start }, 'retry succeeded');
+        logger.info({ target, op, attempt, latencyMs }, 'retry succeeded');
       }
       return result;
     } catch (err) {
+      const latencyMs = Date.now() - start;
+      externalApiDuration.labels(target, op).observe(latencyMs / 1000);
+      const statusClass = classifyStatus(err);
+      externalApiCalls.labels(target, op, statusClass).inc();
       lastErr = err;
       if (attempt === maxAttempts || !retryable(err)) {
         throw err;
       }
+      externalApiRetries.labels(target, op, statusClass).inc();
       const jitter = Math.floor(Math.random() * baseDelay);
       const wait = Math.min(maxDelay, baseDelay * 2 ** (attempt - 1)) + jitter;
       logger.warn(
@@ -59,4 +72,14 @@ export async function callWithRetry<T>(
     }
   }
   throw lastErr;
+}
+
+function classifyStatus(err: unknown): string {
+  if (err instanceof ExternalServiceError && typeof err.upstreamStatus === 'number') {
+    const s = err.upstreamStatus;
+    if (s >= 500) return '5xx';
+    if (s === 429) return '429';
+    if (s >= 400) return '4xx';
+  }
+  return 'network';
 }

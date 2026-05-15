@@ -6,6 +6,11 @@ import { verifyHubSpotSignatureV3 } from '../hubspot/signature.js';
 import { verifyExtensionJwt, extractHubId } from '../hubspot/jwt.js';
 import { claimIdempotencyKey, idempotencyKeyFor } from '../lib/idempotency.js';
 import { enqueueProcessDeal } from '../queue/index.js';
+import { liveEmit } from '../lib/liveEmit.js';
+import {
+  webhookDuplicates,
+  webhookSignatureFailures,
+} from '../metrics/index.js';
 
 const config = loadConfig();
 
@@ -53,6 +58,13 @@ export function registerWebhookRoutes(app: FastifyInstance): void {
         timestampHeader: req.headers['x-hubspot-request-timestamp'] as string | undefined,
       });
       if (!verdict.ok) {
+        webhookSignatureFailures.labels('webhook', verdict.reason).inc();
+        liveEmit('webhooks', portalId, {
+          ts: Date.now(),
+          type: 'signature_failed',
+          hubId: portalId.toString(),
+          data: { reason: verdict.reason },
+        });
         logger.warn(
           { hubId: portalId.toString(), reason: verdict.reason, requestId: req.requestId },
           'webhook signature verification failed',
@@ -85,6 +97,7 @@ export function registerWebhookRoutes(app: FastifyInstance): void {
         const { payload } = await verifyExtensionJwt(token);
         hubId = extractHubId(payload);
       } catch (err) {
+        webhookSignatureFailures.labels('extension', 'bad_jwt').inc();
         logger.warn({ err: { name: (err as Error).name } }, 'workflow extension JWT invalid');
         return reply.code(401).send({ error: 'bad_jwt' });
       }
@@ -129,6 +142,13 @@ async function handleAccepted(app: FastifyInstance, reply: FastifyReply, input: 
   const provisionalJobId = `${input.hubId.toString()}-${dealId.toString()}-${idemKey.slice(0, 12)}`;
   const fresh = await claimIdempotencyKey(idemKey, provisionalJobId, input.hubId);
   if (!fresh) {
+    webhookDuplicates.labels(input.hubId.toString()).inc();
+    liveEmit('webhooks', input.hubId, {
+      ts: Date.now(),
+      type: 'duplicate',
+      hubId: input.hubId.toString(),
+      dealId: dealId.toString(),
+    });
     return reply.code(200).send({ accepted: true, duplicate: true });
   }
 
@@ -146,6 +166,14 @@ async function handleAccepted(app: FastifyInstance, reply: FastifyReply, input: 
     { hubId: input.hubId.toString(), dealId: dealId.toString(), jobId, requestId: input.requestId },
     'webhook accepted',
   );
+  liveEmit('webhooks', input.hubId, {
+    ts: Date.now(),
+    type: 'accepted',
+    hubId: input.hubId.toString(),
+    dealId: dealId.toString(),
+    jobId,
+    data: { source: input.source },
+  });
 
   return reply.code(200).send({ accepted: true, duplicate: false, jobId });
 }

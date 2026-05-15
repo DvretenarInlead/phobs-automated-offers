@@ -12,6 +12,8 @@ import { upsertProductBySku } from '../../hubspot/products.js';
 import { createLineItem } from '../../hubspot/lineItems.js';
 import { createApprovedQuote } from '../../hubspot/quotes.js';
 import { fetchAvailability } from '../../phobs/client.js';
+import { liveEmit } from '../../lib/liveEmit.js';
+import { jobProcessed, jobStepDuration } from '../../metrics/index.js';
 import type { ProcessDealPayload } from '../index.js';
 
 const itemSchema = z
@@ -159,6 +161,14 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
     input: { rateFilters: tenant.rateFilters, ratesIn: availability.rates.length },
     output: { selectedCount: filtered.selected.length, trace: filtered.trace },
   });
+  liveEmit('filter', hubId, {
+    ts: Date.now(),
+    type: 'rate_filters',
+    hubId: hubId.toString(),
+    dealId: dealId.toString(),
+    jobId,
+    data: { in: availability.rates.length, kept: filtered.selected.length, trace: filtered.trace },
+  });
 
   if (filtered.selected.length === 0) {
     log.info('no availability after filtering — marking deal silently');
@@ -255,6 +265,7 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
     },
   });
 
+  jobProcessed.labels('ok').inc();
   log.info({ quoteId: quote.id }, 'processDeal complete');
   return { acknowledged: true, quoteId: quote.id, quoteLink: quote.link };
 }
@@ -277,8 +288,17 @@ async function runStep<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const start = Date.now();
+  liveEmit('jobs', hubId, {
+    ts: start,
+    type: 'step.start',
+    hubId: hubId.toString(),
+    dealId: dealId.toString(),
+    jobId,
+    data: { step, stepIndex },
+  });
   try {
     const output = await fn();
+    const durationMs = Date.now() - start;
     await writeJobStep({
       jobId,
       hubId,
@@ -287,10 +307,20 @@ async function runStep<T>(
       stepIndex,
       status: 'ok',
       output,
-      durationMs: Date.now() - start,
+      durationMs,
+    });
+    jobStepDuration.labels(step, 'ok').observe(durationMs / 1000);
+    liveEmit('jobs', hubId, {
+      ts: Date.now(),
+      type: 'step.ok',
+      hubId: hubId.toString(),
+      dealId: dealId.toString(),
+      jobId,
+      data: { step, stepIndex, durationMs },
     });
     return output;
   } catch (err) {
+    const durationMs = Date.now() - start;
     const error = err instanceof Error ? err.message : String(err);
     await writeJobStep({
       jobId,
@@ -300,7 +330,17 @@ async function runStep<T>(
       stepIndex,
       status: 'error',
       error,
-      durationMs: Date.now() - start,
+      durationMs,
+    });
+    jobStepDuration.labels(step, 'error').observe(durationMs / 1000);
+    jobProcessed.labels('fail').inc();
+    liveEmit('jobs', hubId, {
+      ts: Date.now(),
+      type: 'step.error',
+      hubId: hubId.toString(),
+      dealId: dealId.toString(),
+      jobId,
+      data: { step, stepIndex, durationMs, error },
     });
     throw err;
   }

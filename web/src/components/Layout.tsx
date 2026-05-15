@@ -10,9 +10,13 @@ const navBase = [
   { to: '/live', label: 'Live' },
   { to: '/jobs', label: 'Jobs' },
   { to: '/probe', label: 'Phobs probe' },
+  { to: '/manual-trigger', label: 'Manual trigger' },
   { to: '/settings', label: 'Settings' },
 ];
-const navSuperadmin = [{ to: '/users', label: 'Users' }];
+const navSuperadmin = [
+  { to: '/users', label: 'Users' },
+  { to: '/workflow-extension', label: 'Workflow extension' },
+];
 
 export function Layout(): ReactElement {
   const { user, setUser } = useAuth();

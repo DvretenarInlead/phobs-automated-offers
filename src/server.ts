@@ -1,3 +1,6 @@
+// Tracing must be imported before anything else so auto-instrumentation can
+// patch http/redis/pg/undici before those modules are required.
+import './lib/tracing.js';
 import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';

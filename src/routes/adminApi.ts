@@ -17,6 +17,7 @@ import { seal } from '../crypto/tokenVault.js';
 import { enqueueProcessDeal } from '../queue/index.js';
 import { fetchAvailability } from '../phobs/client.js';
 import { loadTenantContext } from '../tenancy/config.js';
+import { buildWorkflowActionDefinition } from '../hubspot/workflowActionDefinition.js';
 
 const hubIdParamSchema = z.object({ hubId: z.string().regex(/^\d+$/) });
 
@@ -255,6 +256,14 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
     });
     return reply.send({ ok: true, jobId });
   });
+
+  // GET /workflow-action-definition — superadmin only; returns the JSON
+  // definition to paste into the HubSpot dev portal (Workflow Extensions).
+  app.get(
+    `${prefix}/workflow-action-definition`,
+    { preHandler: requireRole('superadmin', { allowSuperadmin: false }) },
+    (_req, reply) => reply.send(buildWorkflowActionDefinition()),
+  );
 
   // POST /phobs-probe — diagnostic; queries Phobs without mutating HubSpot
   app.post(`${prefix}/phobs-probe`, { preHandler: requireRole('tenant_admin') }, async (req, reply) => {

@@ -1,3 +1,4 @@
+import './lib/tracing.js';
 import { makeWorker, scheduleDailyRollup } from './queue/index.js';
 import { processDealJob } from './queue/jobs/processDeal.js';
 import { rollupUsageJob } from './queue/jobs/rollupUsage.js';

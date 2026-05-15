@@ -14,6 +14,8 @@ import { JobDetail } from './pages/JobDetail';
 import { Live } from './pages/Live';
 import { Settings } from './pages/Settings';
 import { Users } from './pages/Users';
+import { ManualTrigger } from './pages/ManualTrigger';
+import { WorkflowExtension } from './pages/WorkflowExtension';
 
 export function App(): ReactElement {
   return (
@@ -35,8 +37,10 @@ export function App(): ReactElement {
         <Route path="jobs" element={<Jobs />} />
         <Route path="jobs/:jobId" element={<JobDetail />} />
         <Route path="probe" element={<PhobsProbe />} />
+        <Route path="manual-trigger" element={<ManualTrigger />} />
         <Route path="settings" element={<Settings />} />
         <Route path="users" element={<Users />} />
+        <Route path="workflow-extension" element={<WorkflowExtension />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

@@ -3,6 +3,8 @@ import type { ReactElement, ReactNode } from 'react';
 import { useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '../lib/api';
+import { RateFiltersEditor } from '../components/RateFiltersEditor';
+import type { RateFilters } from '../components/RateFiltersEditor';
 
 interface ConfigResponse {
   hubId: string;
@@ -42,6 +44,7 @@ export function TenantConfig(): ReactElement {
     phobs_auth_pass_new?: string;
   }>({});
   const [rules, setRules] = useState<PropertyRow[]>([]);
+  const [rateFilters, setRateFilters] = useState<RateFilters>({});
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -67,6 +70,7 @@ export function TenantConfig(): ReactElement {
         gornja: String(r.gornja),
       })),
     );
+    setRateFilters((q.data.rate_filters as RateFilters) ?? {});
   }, [q.data]);
 
   const save = useMutation({
@@ -90,6 +94,7 @@ export function TenantConfig(): ReactElement {
         access_code: form.access_code ?? null,
         trigger_mode: form.trigger_mode,
         property_rules,
+        rate_filters: rateFilters,
       };
       if (form.phobs_auth_user_new) body.phobs_auth_user = form.phobs_auth_user_new;
       if (form.phobs_auth_pass_new) body.phobs_auth_pass = form.phobs_auth_pass_new;
@@ -336,19 +341,8 @@ export function TenantConfig(): ReactElement {
       </section>
 
       <section className="card">
-        <h2 className="font-semibold mb-2">Rate filters</h2>
-        <p className="text-slate-400 text-sm mb-2">
-          Editable JSON. See <code className="text-emerald-400">ARCHITECTURE.md</code> §14 for the
-          schema. A typed editor will replace this in a later release.
-        </p>
-        <textarea
-          className="input font-mono text-xs h-48"
-          value={JSON.stringify(q.data.rate_filters ?? {}, null, 2)}
-          readOnly
-        />
-        <div className="text-xs text-slate-500 mt-2">
-          (Read-only for now; edit via PUT /api/admin/tenants/:hubId/config — UI editor coming.)
-        </div>
+        <h2 className="font-semibold mb-4">Rate filters</h2>
+        <RateFiltersEditor value={rateFilters} onChange={setRateFilters} />
       </section>
     </div>
   );

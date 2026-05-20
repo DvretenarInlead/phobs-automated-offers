@@ -104,7 +104,7 @@ export function registerAdminUserRoutes(app: FastifyInstance, prefix = '/api/adm
   );
 
   // --- Public: GET invite metadata (used by /admin/accept-invite UI) ------
-  app.get(`${prefix}/users/invite/preview`, async (req, reply) => {
+  app.get(`${prefix}/users/invite/preview`, { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (req, reply) => {
     const q = z.object({ token: z.string().min(1).max(4096) }).parse(req.query);
     const payload = verifyInvite(q.token);
     if (!payload) return reply.code(400).send({ error: 'invalid_or_expired' });
@@ -112,7 +112,7 @@ export function registerAdminUserRoutes(app: FastifyInstance, prefix = '/api/adm
   });
 
   // --- Public: accept invite, set password --------------------------------
-  app.post(`${prefix}/users/invite/accept`, async (req, reply) => {
+  app.post(`${prefix}/users/invite/accept`, { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (req, reply) => {
     const body = acceptSchema.parse(req.body);
     const payload = verifyInvite(body.token);
     if (!payload) throw new AuthError('invalid_or_expired_invite');

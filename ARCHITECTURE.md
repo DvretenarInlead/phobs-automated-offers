@@ -19,7 +19,7 @@ HubSpot as a Public App via OAuth.
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                       DO App Platform — Web service                         │
 │  Fastify                                                                    │
-│   ├─ POST /webhooks/hubspot/:portalId   verify sig → enqueue → 200 ack      │
+│   ├─ POST /webhooks/hubspot/:portalId/:token  verify token+sig → enqueue    │
 │   ├─ GET  /oauth/install                start HubSpot OAuth                 │
 │   ├─ GET  /oauth/callback               exchange code, store tokens         │
 │   ├─ /admin/*                           admin UI (auth-gated, see §13)      │
@@ -223,16 +223,23 @@ HubSpot Workflow → "Send a webhook" action sends the array payload you showed.
 We accept it at:
 
 ```
-POST /webhooks/hubspot/:portalId
+POST /webhooks/hubspot/:portalId/:token
 Content-Type: application/json
 X-HubSpot-Signature-v3: ...
 X-HubSpot-Request-Timestamp: ...
 ```
 
+`:token` is a per-tenant value derived as `HMAC-SHA256(SESSION_SECRET, "webhook:"+portalId)`.
+The v3 signature uses the shared *app* client secret and so only proves the request
+came from HubSpot, not *which* portal — without the token the path `:portalId` would be
+attacker-chosen, letting one tenant trigger processing under another tenant's context.
+The admin copies the full URL (shown in the tenant config screen) into the workflow action.
+
 Handler:
 
-1. Read **raw body** (Fastify `addContentTypeParser` capturing buffer).
-2. Reject if timestamp older than 5 minutes.
+1. Verify `:token` against the tenant binding (constant-time). **Reject 401 on mismatch.**
+2. Read **raw body** (Fastify `addContentTypeParser` capturing buffer).
+3. Reject if timestamp older than 5 minutes.
 3. Compute `HMAC-SHA256(client_secret, timestamp + method + url + rawBody)` (HubSpot v3 spec) and `timingSafeEqual` against header. **Reject 401 on mismatch.**
 4. `zod`-parse the body. Reject 400 on invalid shape (don't 500 — HubSpot would retry).
 5. Compute idempotency key = `sha256(portalId|hs_object_id|hash(rawBody))`.
@@ -311,7 +318,8 @@ Handler:
 
 Two entry routes, two verifiers, one downstream pipeline:
 
-**Route A — `/webhooks/hubspot/:portalId` (workflow "Send a webhook" action)**
+**Route A — `/webhooks/hubspot/:portalId/:token` (workflow "Send a webhook" action)**
+- **Per-tenant token** verification first, binding the URL to one portal (the shared-secret HMAC alone can't identify the portal).
 - **HMAC v3** verification on every request, before any parsing logic.
 - Raw body captured via Fastify content-type parser; HMAC computed over raw bytes, never the re-serialised JSON.
 - Header `X-HubSpot-Request-Timestamp` checked against `Date.now()` — reject if >5 min skew.
@@ -689,7 +697,7 @@ You're replacing a Make.com scenario (visible in the `{{1.x}}`, `{{formatDate(..
 | -------------------------------- | --------------------------------------------------------------------------------------------- |
 | Visual flow editor               | Out of scope; pipeline is in code. We'll render a static read-only flowchart in admin instead. |
 | Marketplace of pre-built apps    | Out of scope.                                                                                 |
-| Webhook URL rotation             | Per-tenant unguessable webhook URL token (e.g. `/webhooks/hubspot/:portalId/:secretToken`) so revealing the URL alone is not enough. Add if customer asks. |
+| Webhook URL rotation             | **Done.** Per-tenant unguessable token in the path (`/webhooks/hubspot/:portalId/:token`, derived from `SESSION_SECRET`) binds each URL to one portal. Rotates with `SESSION_SECRET`. |
 | Slack / Teams notifications      | Hook DO Alerts → Slack webhook. 30-min job.                                                   |
 | Multi-region failover            | DO App Platform single-region is fine for v1. Postgres PITR covers DR.                        |
 
@@ -702,7 +710,7 @@ You're replacing a Make.com scenario (visible in the `{{1.x}}`, `{{formatDate(..
 - **Email sending: deal property update → HubSpot workflow sends email.** We do NOT call the HubSpot Single-Send Transactional API. Instead `processDeal` writes `quote_link_custom`, `quote_id`, `number_of_childrens`, `phobs_availability_status` (and language token if needed) to the deal; a HubSpot workflow listens on those properties and fires the correct email template per language. No transactional email add-on required, marketing team owns the content. Single-Send remains available as escape hatch if a future case needs it.
 - **Rate filtering per unit.** Some tenants want to exclude certain rate plans from offers (e.g. unit `17173` should only present BB rates, never HB; or always exclude any `RateId` matching `RATE52580*`). Stored under `tenant_config.rate_filters` JSONB as a typed rule set, editable in the admin UI — no code.
 - **Trigger style: both supported.**
-  1. **Phase 1 — "Send a webhook" workflow action** with HubSpot Signature v3 validation. Tenants paste a per-portal URL (`/webhooks/hubspot/:portalId`) into a HubSpot workflow's webhook action. Fastest to ship; the existing inputFields payload shape is preserved.
+  1. **Phase 1 — "Send a webhook" workflow action** with HubSpot Signature v3 validation. Tenants paste a per-portal URL (`/webhooks/hubspot/:portalId/:token`, where `:token` binds the URL to the portal) into a HubSpot workflow's webhook action. Fastest to ship; the existing inputFields payload shape is preserved.
   2. **Phase 2 — HubSpot Workflow Extension** (custom workflow action registered by our Public App). After install, the action "Phobs Automated Offer" appears in the customer's workflow builder with typed input fields. HubSpot invokes it with a **signed JWT in the `Authorization` header** (different from HMAC v3 — we add a JWT verifier alongside the HMAC verifier, keyed on the same HubSpot client secret / app keys).
   Both paths converge on the same `processDeal` job — only the route handler and signature verifier differ.
 - **Admin auth model: superadmin + one `tenant_admin` per portal.** Two roles only, no `admin` middle tier. Superadmin (you) manages everything; each tenant gets exactly one `tenant_admin` user scoped to their `hub_id` who can view & edit their own config, see their own logs/jobs/live monitoring, and nothing else. The `admin` role in §8b is dropped from v1.

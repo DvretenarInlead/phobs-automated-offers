@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { loadConfig } from '../config.js';
 import { logger } from '../lib/logger.js';
 import { verifyHubSpotSignatureV3 } from '../hubspot/signature.js';
+import { verifyWebhookToken } from '../hubspot/webhookToken.js';
 import { verifyExtensionJwt, extractHubId } from '../hubspot/jwt.js';
 import { claimIdempotencyKey, idempotencyKeyFor } from '../lib/idempotency.js';
 import { enqueueProcessDeal } from '../queue/index.js';
@@ -29,20 +30,36 @@ const HubSpotPayload = z.union([z.array(HubSpotItem).min(1), HubSpotItem]);
 
 export function registerWebhookRoutes(app: FastifyInstance): void {
   // Route A: "Send a webhook" workflow action, HMAC v3.
-  app.post<{ Params: { portalId: string } }>(
-    '/webhooks/hubspot/:portalId',
+  app.post<{ Params: { portalId: string; token: string } }>(
+    '/webhooks/hubspot/:portalId/:token',
     {
       config: { rawBody: true },
       schema: {
         params: {
           type: 'object',
-          required: ['portalId'],
-          properties: { portalId: { type: 'string', pattern: '^[0-9]{1,20}$' } },
+          required: ['portalId', 'token'],
+          properties: {
+            portalId: { type: 'string', pattern: '^[0-9]{1,20}$' },
+            token: { type: 'string', pattern: '^[A-Za-z0-9_-]{16,128}$' },
+          },
         },
       },
     },
     async (req, reply) => {
       const portalId = BigInt(req.params.portalId);
+
+      // Per-tenant token binds this URL to a single portal. The shared-secret
+      // HMAC below proves the request is from HubSpot but not *which* portal,
+      // so without this check the path portalId would be attacker-chosen.
+      if (!verifyWebhookToken(portalId, req.params.token)) {
+        webhookSignatureFailures.labels('webhook', 'bad_token').inc();
+        logger.warn(
+          { hubId: portalId.toString(), requestId: req.requestId },
+          'webhook token verification failed',
+        );
+        return reply.code(401).send({ error: 'bad_token' });
+      }
+
       const rawBody = req.rawBody;
       if (!(rawBody instanceof Buffer)) {
         return reply.code(400).send({ error: 'raw_body_missing' });

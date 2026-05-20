@@ -21,6 +21,8 @@ import {
   verifyCsrfToken,
 } from '../admin/csrf.js';
 import {
+  ACCOUNT_LOCKOUT_THRESHOLD,
+  ACCOUNT_LOCKOUT_WINDOW_SEC,
   LOGIN_LOCKOUT_THRESHOLD,
   bumpLoginAttempt,
   resetLoginAttempts,
@@ -58,12 +60,16 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
       .send({ csrfToken: token, headerName: csrfHeaderName });
   });
 
-  app.post(`${prefix}/login`, async (req, reply) => {
+  app.post(`${prefix}/login`, { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (req, reply) => {
     const start = Date.now();
     const body = loginSchema.parse(req.body);
     const key = `${body.email}|${req.ip}`;
-    const fails = await bumpLoginAttempt(key);
-    if (fails > LOGIN_LOCKOUT_THRESHOLD) {
+    const acctKey = `acct|${body.email}`;
+    const [fails, acctFails] = await Promise.all([
+      bumpLoginAttempt(key),
+      bumpLoginAttempt(acctKey, ACCOUNT_LOCKOUT_WINDOW_SEC),
+    ]);
+    if (fails > LOGIN_LOCKOUT_THRESHOLD || acctFails > ACCOUNT_LOCKOUT_THRESHOLD) {
       // Constant-time-ish delay
       await delay(200);
       throw new AuthError('locked');
@@ -126,7 +132,7 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
       }
     }
 
-    await resetLoginAttempts(key);
+    await resetLoginAttempts(key, acctKey);
     await db
       .update(adminUsers)
       .set({ lastLoginAt: new Date() })

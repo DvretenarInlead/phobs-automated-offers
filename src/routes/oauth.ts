@@ -10,6 +10,7 @@ import { seal } from '../crypto/tokenVault.js';
 
 const config = loadConfig();
 
+const OAUTH_STATE_COOKIE = 'oauth_state';
 const HUBSPOT_AUTH_URL = 'https://app.hubspot.com/oauth/authorize';
 const HUBSPOT_TOKEN_URL = 'https://api.hubapi.com/oauth/v1/token';
 const HUBSPOT_ACCOUNT_INFO_URL = 'https://api.hubapi.com/account-info/v3/details';
@@ -56,22 +57,47 @@ function verifyState(state: string, maxAgeMs = 10 * 60 * 1000): { nonce: string 
 
 export function registerOAuthRoutes(app: FastifyInstance): void {
   app.get('/oauth/install', (_req, reply) => {
-    const state = signState({ nonce: randomBytes(16).toString('hex'), ts: Date.now() });
+    const nonce = randomBytes(16).toString('hex');
+    const state = signState({ nonce, ts: Date.now() });
     const url = new URL(HUBSPOT_AUTH_URL);
     url.searchParams.set('client_id', config.HUBSPOT_CLIENT_ID);
     url.searchParams.set('redirect_uri', config.HUBSPOT_REDIRECT_URI);
     url.searchParams.set('scope', config.hubspotScopes.join(' '));
     url.searchParams.set('state', state);
-    return reply.redirect(url.toString(), 302);
+    // Bind the state to this browser. SameSite=Lax so the cookie survives the
+    // top-level redirect back from HubSpot but is not sent on cross-site
+    // sub-requests. Verified in the callback to block OAuth/install CSRF.
+    return reply
+      .setCookie(OAUTH_STATE_COOKIE, nonce, {
+        path: '/oauth',
+        httpOnly: true,
+        secure: true,
+        sameSite: 'lax',
+        maxAge: 600,
+      })
+      .redirect(url.toString(), 302);
   });
 
   app.get<{ Querystring: { code?: string; state?: string; error?: string } }>(
     '/oauth/callback',
+    { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
     async (req, reply) => {
       const { code, state, error } = req.query;
       if (error) return reply.code(400).send({ error });
       if (!code || !state) return reply.code(400).send({ error: 'missing_code_or_state' });
-      if (!verifyState(state)) return reply.code(400).send({ error: 'bad_state' });
+      const verified = verifyState(state);
+      const stateCookie = req.cookies?.[OAUTH_STATE_COOKIE] ?? '';
+      const nonceBuf = Buffer.from(verified?.nonce ?? '');
+      const cookieBuf = Buffer.from(stateCookie);
+      if (
+        !verified ||
+        nonceBuf.length === 0 ||
+        nonceBuf.length !== cookieBuf.length ||
+        !timingSafeEqual(nonceBuf, cookieBuf)
+      ) {
+        return reply.code(400).send({ error: 'bad_state' });
+      }
+      void reply.clearCookie(OAUTH_STATE_COOKIE, { path: '/oauth' });
 
       // Exchange code for tokens
       const tokens = await exchangeCode(code);

@@ -8,6 +8,7 @@ import rateLimit from '@fastify/rate-limit';
 import staticPlugin from '@fastify/static';
 import rawBody from 'fastify-raw-body';
 import { randomUUID } from 'node:crypto';
+import { ZodError } from 'zod';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -128,9 +129,21 @@ async function buildApp() {
     );
   }
 
-  app.setErrorHandler((err: Error & { statusCode?: number }, req, reply) => {
+  app.setErrorHandler((err: Error & { statusCode?: number; code?: string }, req, reply) => {
     req.log.error({ err }, 'request failed');
+
+    // Zod validation failures (thrown by `.parse()` in handlers) → 400.
+    if (err instanceof ZodError) {
+      return reply.code(400).send({ error: 'validation_failed', detail: err.format() });
+    }
+
     const statusCode = err.statusCode ?? 500;
+    // Only surface messages for intentional, client-facing errors (4xx). For
+    // 5xx, return a generic message so internal details (DB errors, upstream
+    // response bodies, stack messages) are never leaked to clients.
+    if (statusCode >= 500) {
+      return reply.code(statusCode).send({ error: 'internal_error', requestId: req.requestId });
+    }
     return reply.code(statusCode).send({ error: err.message });
   });
 

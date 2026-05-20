@@ -8,6 +8,7 @@ import type { RateFilters } from '../components/RateFiltersEditor';
 
 interface ConfigResponse {
   hubId: string;
+  webhook_url: string;
   phobs_endpoint: string;
   phobs_site_id: string;
   phobs_auth_user: string; // masked
@@ -137,6 +138,17 @@ export function TenantConfig(): ReactElement {
           </button>
         </div>
       </header>
+
+      <section className="card">
+        <h2 className="font-semibold mb-2">Webhook URL</h2>
+        <p className="text-slate-400 text-sm mb-3">
+          Paste this exact URL into the HubSpot "Send a webhook" workflow action. The token
+          binds the URL to this tenant — do not share it or use another tenant's portal id.
+        </p>
+        <code className="block font-mono text-xs bg-slate-950 rounded p-3 break-all text-emerald-300">
+          {q.data?.webhook_url ?? ''}
+        </code>
+      </section>
 
       <section className="card">
         <h2 className="font-semibold mb-4">Phobs connection</h2>

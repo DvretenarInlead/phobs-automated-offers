@@ -22,8 +22,17 @@ export async function bumpLoginAttempt(key: string, windowSec = 900): Promise<nu
   return typeof first === 'number' ? first : Number(first ?? 0);
 }
 
-export async function resetLoginAttempts(key: string): Promise<void> {
-  await redis().del(`login:fail:${key}`);
+export async function resetLoginAttempts(...keys: string[]): Promise<void> {
+  if (keys.length === 0) return;
+  await redis().del(...keys.map((k) => `login:fail:${k}`));
 }
 
+/** Per (email, ip) — stops a single source brute-forcing one account. */
 export const LOGIN_LOCKOUT_THRESHOLD = 10;
+/**
+ * Per account (email, any ip) — stops distributed credential stuffing that
+ * rotates source IPs to evade the per-(email,ip) counter. Set higher and on a
+ * longer window so legitimate multi-location logins aren't locked out.
+ */
+export const ACCOUNT_LOCKOUT_THRESHOLD = 50;
+export const ACCOUNT_LOCKOUT_WINDOW_SEC = 3600;

@@ -12,14 +12,26 @@ const base64Bytes = (min: number) =>
     { message: `must decode to >= ${min} bytes of base64` },
   );
 
+const base64ExactBytes = (n: number) =>
+  z.string().refine(
+    (v) => {
+      try {
+        return Buffer.from(v, 'base64').length === n;
+      } catch {
+        return false;
+      }
+    },
+    { message: `must decode to exactly ${n} bytes of base64` },
+  );
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(8080),
   PUBLIC_BASE_URL: z.string().url(),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 
-  TOKEN_VAULT_KEY: base64Bytes(32),
-  TOKEN_VAULT_KEY_PREV: base64Bytes(32).optional(),
+  TOKEN_VAULT_KEY: base64ExactBytes(32),
+  TOKEN_VAULT_KEY_PREV: base64ExactBytes(32).optional(),
 
   SESSION_SECRET: base64Bytes(32),
 

@@ -11,11 +11,13 @@ import {
 } from '../db/schema.js';
 import { requireRole } from '../admin/auth.js';
 import { writeAdminAudit } from '../admin/audit.js';
+import { loadConfig } from '../config.js';
 import { propertyRulesSchema } from '../tenancy/childAgeRules.js';
 import { rateFiltersSchema } from '../tenancy/rateFilters.js';
 import { seal } from '../crypto/tokenVault.js';
 import { enqueueProcessDeal } from '../queue/index.js';
-import { fetchAvailability } from '../phobs/client.js';
+import { fetchAvailability, isAllowedPhobsEndpoint } from '../phobs/client.js';
+import { webhookUrlFor } from '../hubspot/webhookToken.js';
 import { loadTenantContext } from '../tenancy/config.js';
 import { buildWorkflowActionDefinition } from '../hubspot/workflowActionDefinition.js';
 
@@ -91,6 +93,7 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
       if (!cfg) return reply.code(404).send({ error: 'not_found' });
       return reply.send({
         hubId: hubIdStr,
+        webhook_url: webhookUrlFor(loadConfig().PUBLIC_BASE_URL, hubId),
         phobs_endpoint: cfg.phobsEndpoint,
         phobs_site_id: cfg.phobsSiteId,
         phobs_auth_user: '••••••••',
@@ -116,6 +119,12 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
       const { hubId: hubIdStr } = hubIdParamSchema.parse(req.params);
       const hubId = BigInt(hubIdStr);
       const body = updateConfigSchema.parse(req.body);
+
+      // Defence-in-depth: reject non-allowlisted Phobs endpoints at save time
+      // too (the Phobs client also enforces this at call time).
+      if (body.phobs_endpoint !== undefined && !isAllowedPhobsEndpoint(body.phobs_endpoint)) {
+        return reply.code(400).send({ error: 'phobs_endpoint_not_allowlisted' });
+      }
 
       const [existing] = await db
         .select()

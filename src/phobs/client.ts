@@ -18,6 +18,16 @@ export interface PhobsClientOpts {
  */
 const ALLOWED_HOSTS_RE = /(^|\.)phobs\.net$/i;
 
+/** True if `endpoint` is a well-formed https URL on an allow-listed Phobs host. */
+export function isAllowedPhobsEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint);
+    return url.protocol === 'https:' && ALLOWED_HOSTS_RE.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function assertAllowedEndpoint(endpoint: string): URL {
   let url: URL;
   try {

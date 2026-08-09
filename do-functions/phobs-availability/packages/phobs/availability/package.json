@@ -1,0 +1,16 @@
+{
+  "name": "phobs-availability-probe",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "example": "node index.js \"$(cat example-input.json)\""
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.5.1"
+  }
+}

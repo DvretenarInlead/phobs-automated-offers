@@ -1,0 +1,32 @@
+# DigitalOcean Functions project spec.
+# Deploy with:  doctl serverless deploy .
+#
+# Credentials are supplied via the package-level `environment` block below.
+# For deploy, either:
+#   (a) put real values in a local .env file and reference it:
+#         doctl serverless deploy . --env .env
+#   (b) set them via the DO web console: Functions -> your-namespace ->
+#         phobs -> Sources -> Environment Variables
+# Never commit real values to project.yml.
+targetNamespace: ''
+parameters: {}
+packages:
+  - name: phobs
+    parameters: {}
+    # Package-level env — inherited by every action inside `phobs/`.
+    environment:
+      PHOBS_ENDPOINT: ${PHOBS_ENDPOINT}
+      PHOBS_SITE_ID: ${PHOBS_SITE_ID}
+      PHOBS_USERNAME: ${PHOBS_USERNAME}
+      PHOBS_PASSWORD: ${PHOBS_PASSWORD}
+    annotations: {}
+    actions:
+      - name: availability
+        binary: false
+        main: 'main'
+        runtime: 'nodejs:18'
+        web: true                # exposes an HTTPS URL you can curl
+        webSecure: false         # set true + require-auth header to gate
+        limits:
+          timeout: 30000         # ms; Phobs sometimes takes ~10s
+          memory: 256            # MB

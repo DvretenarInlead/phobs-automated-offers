@@ -200,3 +200,30 @@ export const adminAudit = pgTable(
   },
   (t) => [index('admin_audit_user_idx').on(t.adminUserId, t.createdAt)],
 );
+
+/**
+ * Per-tenant bearer tokens for the public `POST /api/trigger` endpoint.
+ * Plaintext token exists ONLY in the response of the mint call — the DB
+ * stores its SHA-256 hash. `tokenPrefix` is the first 12 chars of plaintext
+ * kept for UI display ("phk_abc123def456…"). Revoke by setting revokedAt.
+ */
+export const apiTokens = pgTable(
+  'api_tokens',
+  {
+    id: bigserial('id', { mode: 'bigint' }).primaryKey(),
+    hubId: bigint('hub_id', { mode: 'bigint' })
+      .notNull()
+      .references(() => tenants.hubId, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    tokenPrefix: text('token_prefix').notNull(),
+    tokenHash: text('token_hash').notNull(),
+    createdByAdminUserId: bigint('created_by_admin_user_id', { mode: 'bigint' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('api_tokens_hash_uq').on(t.tokenHash),
+    index('api_tokens_hub_idx').on(t.hubId),
+  ],
+);

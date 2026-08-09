@@ -15,6 +15,13 @@
       "when": 1786263345186,
       "tag": "0001_unique_kronos",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786269800000,
+      "tag": "0002_api_tokens",
+      "breakpoints": true
     }
   ]
 }

@@ -99,7 +99,10 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
         hubdb_column_map: cfg.hubdbColumnMap,
         quote_template_id: cfg.quoteTemplateId,
         owner_id: cfg.ownerId.toString(),
-        access_code: cfg.accessCode,
+        // Loyalty access code is a shared secret with Phobs; mask like Phobs
+        // creds. UI shows whether it's set via `access_code_set`.
+        access_code: cfg.accessCode ? '••••••••' : null,
+        access_code_set: Boolean(cfg.accessCode),
         property_rules: cfg.propertyRules,
         rate_filters: cfg.rateFilters,
         trigger_mode: cfg.triggerMode,

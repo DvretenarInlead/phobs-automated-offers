@@ -7,6 +7,7 @@ import { AcceptInvite } from './pages/AcceptInvite';
 import { Dashboard } from './pages/Dashboard';
 import { Tenants } from './pages/Tenants';
 import { TenantConfig } from './pages/TenantConfig';
+import { ApiTokens } from './pages/ApiTokens';
 import { PhobsProbe } from './pages/PhobsProbe';
 import { Activity } from './pages/Activity';
 import { Jobs } from './pages/Jobs';
@@ -32,6 +33,7 @@ export function App(): ReactElement {
         <Route index element={<Dashboard />} />
         <Route path="tenants" element={<Tenants />} />
         <Route path="tenants/:hubId" element={<TenantConfig />} />
+        <Route path="tenants/:hubId/api-tokens" element={<ApiTokens />} />
         <Route path="activity" element={<Activity />} />
         <Route path="live" element={<Live />} />
         <Route path="jobs" element={<Jobs />} />

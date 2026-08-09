@@ -5,6 +5,8 @@ import { openUtf8 } from '../crypto/tokenVault.js';
 import { TenantNotFoundError, TenantSuspendedError } from '../lib/errors.js';
 import type { PropertyRules } from './childAgeRules.js';
 import type { RateFilters } from './rateFilters.js';
+import { resolveOverrides } from './overrides.js';
+import type { Overrides } from './overrides.js';
 
 export interface HubdbColumnMap {
   unit_id_column?: string;
@@ -29,6 +31,7 @@ export interface TenantContext {
   propertyRules: PropertyRules;
   rateFilters: RateFilters | Record<string, never>;
   triggerMode: 'webhook' | 'workflow_extension';
+  overrides: Overrides;
 }
 
 export async function loadTenantContext(hubId: bigint): Promise<TenantContext> {
@@ -69,5 +72,6 @@ export async function loadTenantContext(hubId: bigint): Promise<TenantContext> {
     propertyRules: cfg.propertyRules as PropertyRules,
     rateFilters: cfg.rateFilters as RateFilters,
     triggerMode: (cfg.triggerMode as 'webhook' | 'workflow_extension') ?? 'webhook',
+    overrides: resolveOverrides(cfg.overrides),
   };
 }

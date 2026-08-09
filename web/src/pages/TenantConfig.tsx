@@ -5,6 +5,43 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '../lib/api';
 import { RateFiltersEditor } from '../components/RateFiltersEditor';
 import type { RateFilters } from '../components/RateFiltersEditor';
+import { OverridesEditor } from '../components/OverridesEditor';
+import type { Overrides } from '../components/OverridesEditor';
+
+// Server-populated defaults for a fresh tenant with no overrides yet — used
+// only if the API somehow returns an empty overrides object (it should always
+// return a fully-populated one thanks to zod).
+const OVERRIDES_FALLBACK: Overrides = {
+  input_field_map: {
+    deal_id: 'hs_object_id',
+    property_id: 'rezapp___property_id',
+    language: 'jezik_ponude',
+    adults: 'rezzapp___broj_odraslih',
+    fallback_adults: 'number_of_adults',
+    child_ages: ['child_age_1', 'child_age_2', 'child_age_3', 'child_age_4', 'child_age_5'],
+    check_in_ms: 'picker_date_check_in',
+    check_out_ms: 'picker_date_check_out',
+    nights_ms: 'reservation___nights',
+    loyalty_id: 'bluesunrewards___loyaltyid',
+  },
+  output_field_map: {
+    quote_link: 'quote_link_custom',
+    quote_id: 'quote_id',
+    availability_status: 'phobs_availability_status',
+    num_children: 'number_of_childrens',
+    adults: 'rezzapp___broj_odraslih',
+    child_age_slots: ['child_age_1', 'child_age_2', 'child_age_3', 'child_age_4', 'child_age_5'],
+  },
+  quote_defaults: {
+    expiration_days: 3,
+    title_template: 'This is your personalized offer #{dealId}',
+    currency_fallback: 'EUR',
+  },
+  skip_conditions: [],
+  loyalty_rule: { trigger_property: 'bluesunrewards___loyaltyid', trigger_condition: 'present' },
+  default_lang: 'en',
+  product_sku_template: '{portalId}:{unitId}:{rateId}',
+};
 
 interface ConfigResponse {
   hubId: string;
@@ -20,6 +57,7 @@ interface ConfigResponse {
   property_rules: Record<string, { name: string; donja: number; gornja: number }>;
   rate_filters: Record<string, unknown>;
   trigger_mode: 'webhook' | 'workflow_extension';
+  overrides?: Overrides;
 }
 
 interface PropertyRow {
@@ -45,6 +83,7 @@ export function TenantConfig(): ReactElement {
   }>({});
   const [rules, setRules] = useState<PropertyRow[]>([]);
   const [rateFilters, setRateFilters] = useState<RateFilters>({});
+  const [overrides, setOverrides] = useState<Overrides>(OVERRIDES_FALLBACK);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -71,6 +110,7 @@ export function TenantConfig(): ReactElement {
       })),
     );
     setRateFilters((q.data.rate_filters as RateFilters) ?? {});
+    setOverrides(q.data.overrides ?? OVERRIDES_FALLBACK);
   }, [q.data]);
 
   const save = useMutation({
@@ -95,6 +135,7 @@ export function TenantConfig(): ReactElement {
         trigger_mode: form.trigger_mode,
         property_rules,
         rate_filters: rateFilters,
+        overrides,
       };
       if (form.phobs_auth_user_new) body.phobs_auth_user = form.phobs_auth_user_new;
       if (form.phobs_auth_pass_new) body.phobs_auth_pass = form.phobs_auth_pass_new;
@@ -343,6 +384,15 @@ export function TenantConfig(): ReactElement {
       <section className="card">
         <h2 className="font-semibold mb-4">Rate filters</h2>
         <RateFiltersEditor value={rateFilters} onChange={setRateFilters} />
+      </section>
+
+      <section className="card">
+        <h2 className="font-semibold mb-2">Pipeline overrides</h2>
+        <p className="text-slate-400 text-sm mb-4">
+          Change how the webhook is interpreted and what gets written back — without a code
+          deploy. Field maps, skip conditions, quote defaults, SKU template, loyalty rule.
+        </p>
+        <OverridesEditor value={overrides} onChange={setOverrides} />
       </section>
     </div>
   );

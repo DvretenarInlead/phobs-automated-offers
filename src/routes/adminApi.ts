@@ -13,6 +13,7 @@ import { requireRole } from '../admin/auth.js';
 import { writeAdminAudit } from '../admin/audit.js';
 import { propertyRulesSchema } from '../tenancy/childAgeRules.js';
 import { rateFiltersSchema } from '../tenancy/rateFilters.js';
+import { overridesSchema, resolveOverrides } from '../tenancy/overrides.js';
 import { seal } from '../crypto/tokenVault.js';
 import { enqueueProcessDeal } from '../queue/index.js';
 import { fetchAvailability } from '../phobs/client.js';
@@ -34,6 +35,7 @@ const updateConfigSchema = z.object({
   property_rules: propertyRulesSchema.optional(),
   rate_filters: rateFiltersSchema.optional(),
   trigger_mode: z.enum(['webhook', 'workflow_extension']).optional(),
+  overrides: overridesSchema.optional(),
 });
 
 const manualTriggerSchema = z.object({
@@ -106,6 +108,10 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
         property_rules: cfg.propertyRules,
         rate_filters: cfg.rateFilters,
         trigger_mode: cfg.triggerMode,
+        // Overrides is normalised through the zod schema so the UI always
+        // receives a fully-populated object (defaults applied for missing
+        // keys) — makes the form dead simple to render.
+        overrides: resolveOverrides(cfg.overrides),
         updated_at: cfg.updatedAt.toISOString(),
       });
     },
@@ -149,6 +155,7 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
       if (body.property_rules !== undefined) updates.propertyRules = body.property_rules;
       if (body.rate_filters !== undefined) updates.rateFilters = body.rate_filters;
       if (body.trigger_mode !== undefined) updates.triggerMode = body.trigger_mode;
+      if (body.overrides !== undefined) updates.overrides = body.overrides;
 
       if (!existing) return reply.code(404).send({ error: 'config_not_initialized' });
 

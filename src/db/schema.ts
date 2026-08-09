@@ -69,6 +69,11 @@ export const tenantConfig = pgTable('tenant_config', {
   propertyRules: jsonb('property_rules').notNull().default(sql`'{}'::jsonb`),
   rateFilters: jsonb('rate_filters').notNull().default(sql`'{}'::jsonb`),
   triggerMode: text('trigger_mode').notNull().default('webhook'),
+  /** UI-editable pipeline overrides — input/output field maps, quote defaults,
+   *  skip conditions, loyalty rule, product SKU template, default language.
+   *  Shape is defined by src/tenancy/overrides.ts; missing keys use defaults
+   *  that preserve legacy behaviour so this column is safe to add empty. */
+  overrides: jsonb('overrides').notNull().default(sql`'{}'::jsonb`),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
 

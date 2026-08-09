@@ -1,47 +1,11 @@
 import { useEffect, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
-import { useParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '../lib/api';
 import { RateFiltersEditor } from '../components/RateFiltersEditor';
 import type { RateFilters } from '../components/RateFiltersEditor';
-import { OverridesEditor } from '../components/OverridesEditor';
-import type { Overrides } from '../components/OverridesEditor';
-
-// Server-populated defaults for a fresh tenant with no overrides yet — used
-// only if the API somehow returns an empty overrides object (it should always
-// return a fully-populated one thanks to zod).
-const OVERRIDES_FALLBACK: Overrides = {
-  input_field_map: {
-    deal_id: 'hs_object_id',
-    property_id: 'rezapp___property_id',
-    language: 'jezik_ponude',
-    adults: 'rezzapp___broj_odraslih',
-    fallback_adults: 'number_of_adults',
-    child_ages: ['child_age_1', 'child_age_2', 'child_age_3', 'child_age_4', 'child_age_5'],
-    check_in_ms: 'picker_date_check_in',
-    check_out_ms: 'picker_date_check_out',
-    nights_ms: 'reservation___nights',
-    loyalty_id: 'bluesunrewards___loyaltyid',
-  },
-  output_field_map: {
-    quote_link: 'quote_link_custom',
-    quote_id: 'quote_id',
-    availability_status: 'phobs_availability_status',
-    num_children: 'number_of_childrens',
-    adults: 'rezzapp___broj_odraslih',
-    child_age_slots: ['child_age_1', 'child_age_2', 'child_age_3', 'child_age_4', 'child_age_5'],
-  },
-  quote_defaults: {
-    expiration_days: 3,
-    title_template: 'This is your personalized offer #{dealId}',
-    currency_fallback: 'EUR',
-  },
-  skip_conditions: [],
-  loyalty_rule: { trigger_property: 'bluesunrewards___loyaltyid', trigger_condition: 'present' },
-  default_lang: 'en',
-  product_sku_template: '{portalId}:{unitId}:{rateId}',
-};
+import { CidrListEditor } from '../components/CidrListEditor';
 
 interface ConfigResponse {
   hubId: string;
@@ -57,7 +21,6 @@ interface ConfigResponse {
   property_rules: Record<string, { name: string; donja: number; gornja: number }>;
   rate_filters: Record<string, unknown>;
   trigger_mode: 'webhook' | 'workflow_extension';
-  overrides?: Overrides;
 }
 
 interface PropertyRow {
@@ -83,7 +46,6 @@ export function TenantConfig(): ReactElement {
   }>({});
   const [rules, setRules] = useState<PropertyRow[]>([]);
   const [rateFilters, setRateFilters] = useState<RateFilters>({});
-  const [overrides, setOverrides] = useState<Overrides>(OVERRIDES_FALLBACK);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -110,7 +72,6 @@ export function TenantConfig(): ReactElement {
       })),
     );
     setRateFilters((q.data.rate_filters as RateFilters) ?? {});
-    setOverrides(q.data.overrides ?? OVERRIDES_FALLBACK);
   }, [q.data]);
 
   const save = useMutation({
@@ -135,7 +96,6 @@ export function TenantConfig(): ReactElement {
         trigger_mode: form.trigger_mode,
         property_rules,
         rate_filters: rateFilters,
-        overrides,
       };
       if (form.phobs_auth_user_new) body.phobs_auth_user = form.phobs_auth_user_new;
       if (form.phobs_auth_pass_new) body.phobs_auth_pass = form.phobs_auth_pass_new;
@@ -386,15 +346,114 @@ export function TenantConfig(): ReactElement {
         <RateFiltersEditor value={rateFilters} onChange={setRateFilters} />
       </section>
 
+      <WebhookAllowlistSection hubId={hubId!} />
+
       <section className="card">
-        <h2 className="font-semibold mb-2">Pipeline overrides</h2>
-        <p className="text-slate-400 text-sm mb-4">
-          Change how the webhook is interpreted and what gets written back — without a code
-          deploy. Field maps, skip conditions, quote defaults, SKU template, loyalty rule.
+        <h2 className="font-semibold mb-2">API tokens</h2>
+        <p className="text-sm text-slate-400 mb-3">
+          Manage bearer tokens used by external integrations calling{' '}
+          <code className="font-mono">POST /api/trigger</code>, and their per-token IP
+          allow-lists.
         </p>
-        <OverridesEditor value={overrides} onChange={setOverrides} />
+        <Link
+          to={`/tenants/${hubId!}/api-tokens`}
+          className="text-emerald-400 hover:text-emerald-300 text-sm"
+        >
+          Manage API tokens →
+        </Link>
       </section>
     </div>
+  );
+}
+
+interface WebhookAllowlistResponse {
+  webhook_ip_allowlist_cidrs: string[];
+}
+
+function WebhookAllowlistSection({ hubId }: { hubId: string }): ReactElement {
+  const qc = useQueryClient();
+  const q = useQuery({
+    queryKey: ['webhook-allowlist', hubId],
+    queryFn: () => api<WebhookAllowlistResponse>(`/tenants/${hubId}/webhook-allowlist`),
+  });
+  const [cidrs, setCidrs] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<Date | null>(null);
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    if (q.data && !hydrated) {
+      setCidrs(q.data.webhook_ip_allowlist_cidrs);
+      setHydrated(true);
+    }
+  }, [q.data, hydrated]);
+
+  const save = useMutation({
+    mutationFn: (): Promise<{ ok: true }> =>
+      api(`/tenants/${hubId}/webhook-allowlist`, {
+        method: 'PUT',
+        body: { webhook_ip_allowlist_cidrs: cidrs },
+      }),
+    onSuccess: async () => {
+      setError(null);
+      setSavedAt(new Date());
+      await qc.invalidateQueries({ queryKey: ['webhook-allowlist', hubId] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError) {
+        const detail = err.detail as { invalid?: string[] } | null;
+        if (err.message === 'invalid_cidrs' && detail?.invalid?.length) {
+          setError(`Invalid entries: ${detail.invalid.join(', ')}`);
+          return;
+        }
+        setError(err.message);
+        return;
+      }
+      setError('save_failed');
+    },
+  });
+
+  return (
+    <section className="card">
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="font-semibold">HubSpot webhook IP allow-list</h2>
+        <div className="flex items-center gap-3">
+          {savedAt && (
+            <span className="text-emerald-400 text-xs">
+              Saved {savedAt.toLocaleTimeString()}
+            </span>
+          )}
+          {error && <span className="text-rose-400 text-xs">{error}</span>}
+          <button
+            type="button"
+            className="btn-primary text-xs"
+            disabled={save.isPending || !hydrated}
+            onClick={() => save.mutate()}
+          >
+            {save.isPending ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+      <p className="text-sm text-slate-400 mb-3">
+        Restrict which client IPs may hit{' '}
+        <code className="font-mono">POST /webhooks/hubspot/{hubId}</code> and{' '}
+        <code className="font-mono">POST /workflow-actions/process-deal</code> for this
+        tenant. HubSpot fires from AWS ranges — leave empty unless you've fronted us with a
+        fixed-IP egress proxy. HMAC/JWT verification still runs first; this is
+        defence-in-depth.
+      </p>
+      {q.isPending ? (
+        <div className="text-slate-500 text-sm">Loading…</div>
+      ) : q.error ? (
+        <div className="text-rose-400 text-sm">Failed to load allow-list.</div>
+      ) : (
+        <CidrListEditor
+          value={cidrs}
+          onChange={setCidrs}
+          emptyHint="No entries — any IP that passes HMAC/JWT is accepted."
+        />
+      )}
+    </section>
   );
 }
 

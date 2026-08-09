@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { loadConfig } from '../config.js';
 import { logger } from '../lib/logger.js';
@@ -27,12 +27,29 @@ const HubSpotItem = z
 
 const HubSpotPayload = z.union([z.array(HubSpotItem).min(1), HubSpotItem]);
 
+// Per-tenant webhook rate limit. HubSpot itself is rate-limited on its side,
+// so a legitimate portal will not exceed this. Keyed by portalId so a burst
+// from one tenant can't starve another, and to prevent an attacker who
+// discovers the URL from flooding us into an OOM (each request buffers up
+// to 1 MB, computes HMAC, hits Redis+DB, enqueues to BullMQ).
+const WEBHOOK_RL = {
+  max: 60,
+  timeWindow: '1 minute',
+  keyGenerator: (req: FastifyRequest): string => {
+    const params = req.params as { portalId?: string } | undefined;
+    return `webhook:${params?.portalId ?? 'unknown'}`;
+  },
+};
+const EXTENSION_RL = { max: 120, timeWindow: '1 minute' };
+
+export const rateLimits = { WEBHOOK_RL, EXTENSION_RL };
+
 export function registerWebhookRoutes(app: FastifyInstance): void {
   // Route A: "Send a webhook" workflow action, HMAC v3.
   app.post<{ Params: { portalId: string } }>(
     '/webhooks/hubspot/:portalId',
     {
-      config: { rawBody: true },
+      config: { rawBody: true, rateLimit: WEBHOOK_RL },
       schema: {
         params: {
           type: 'object',
@@ -69,7 +86,8 @@ export function registerWebhookRoutes(app: FastifyInstance): void {
           { hubId: portalId.toString(), reason: verdict.reason, requestId: req.requestId },
           'webhook signature verification failed',
         );
-        return reply.code(401).send({ error: verdict.reason });
+        // Opaque to callers — logs + metrics carry the reason.
+        return reply.code(401).send({ error: 'unauthorized' });
       }
 
       return handleAccepted(app, reply, {
@@ -85,7 +103,7 @@ export function registerWebhookRoutes(app: FastifyInstance): void {
   // Route B: Workflow Extension (custom action), JWT.
   app.post(
     '/workflow-actions/process-deal',
-    { config: { rawBody: true } },
+    { config: { rawBody: true, rateLimit: EXTENSION_RL } },
     async (req, reply) => {
       const auth = req.headers.authorization;
       if (!auth || !auth.startsWith('Bearer ')) {
@@ -130,7 +148,13 @@ interface AcceptInput {
 async function handleAccepted(app: FastifyInstance, reply: FastifyReply, input: AcceptInput) {
   const parsed = HubSpotPayload.safeParse(input.body);
   if (!parsed.success) {
-    return reply.code(400).send({ error: 'invalid_payload', detail: parsed.error.format() });
+    // Log the shape server-side; don't echo it to the caller (it'd help
+    // attackers probe the accepted payload schema).
+    app.log.warn(
+      { hubId: input.hubId.toString(), detail: parsed.error.format() },
+      'webhook rejected: invalid payload',
+    );
+    return reply.code(400).send({ error: 'invalid_payload' });
   }
   const first = Array.isArray(parsed.data) ? parsed.data[0]! : parsed.data;
   const dealIdRaw = first.hs_object_id;

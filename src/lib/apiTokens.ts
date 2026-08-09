@@ -27,6 +27,7 @@ export interface MintedToken {
   plaintext: string;
   /** First 12 chars of plaintext, safe to show in the UI list. */
   prefix: string;
+  ipAllowlistCidrs: string[];
   createdAt: Date;
 }
 
@@ -35,6 +36,7 @@ export interface ApiTokenRow {
   hubId: bigint;
   name: string;
   tokenPrefix: string;
+  ipAllowlistCidrs: string[];
   createdAt: Date;
   lastUsedAt: Date | null;
   revokedAt: Date | null;
@@ -47,11 +49,13 @@ export interface ApiTokenRow {
 export async function mintApiToken(input: {
   hubId: bigint;
   name: string;
+  ipAllowlistCidrs?: string[];
   createdByAdminUserId?: bigint | null;
 }): Promise<MintedToken> {
   const plaintext = TOKEN_PREFIX + randomBytes(TOKEN_ENTROPY_BYTES).toString('base64url');
   const prefix = plaintext.slice(0, 12);
   const hash = hashToken(plaintext);
+  const ipAllowlistCidrs = input.ipAllowlistCidrs ?? [];
 
   const [row] = await db
     .insert(apiTokens)
@@ -60,6 +64,7 @@ export async function mintApiToken(input: {
       name: input.name,
       tokenPrefix: prefix,
       tokenHash: hash,
+      ipAllowlistCidrs,
       createdByAdminUserId: input.createdByAdminUserId ?? null,
     })
     .returning({
@@ -76,8 +81,23 @@ export async function mintApiToken(input: {
     name: row.name,
     plaintext,
     prefix,
+    ipAllowlistCidrs,
     createdAt: row.createdAt,
   };
+}
+
+/** Replaces the IP allow-list on an existing token. Empty array clears it. */
+export async function updateApiTokenAllowlist(
+  hubId: bigint,
+  tokenId: bigint,
+  cidrs: string[],
+): Promise<boolean> {
+  const res = await db
+    .update(apiTokens)
+    .set({ ipAllowlistCidrs: cidrs })
+    .where(and(eq(apiTokens.id, tokenId), eq(apiTokens.hubId, hubId), isNull(apiTokens.revokedAt)))
+    .returning({ id: apiTokens.id });
+  return res.length > 0;
 }
 
 /**
@@ -118,6 +138,7 @@ export async function verifyApiToken(plaintext: string): Promise<ApiTokenRow | n
     hubId: row.hubId,
     name: row.name,
     tokenPrefix: row.tokenPrefix,
+    ipAllowlistCidrs: (row.ipAllowlistCidrs as string[] | null) ?? [],
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
     revokedAt: row.revokedAt,
@@ -131,13 +152,17 @@ export async function listApiTokens(hubId: bigint): Promise<ApiTokenRow[]> {
       hubId: apiTokens.hubId,
       name: apiTokens.name,
       tokenPrefix: apiTokens.tokenPrefix,
+      ipAllowlistCidrs: apiTokens.ipAllowlistCidrs,
       createdAt: apiTokens.createdAt,
       lastUsedAt: apiTokens.lastUsedAt,
       revokedAt: apiTokens.revokedAt,
     })
     .from(apiTokens)
     .where(eq(apiTokens.hubId, hubId));
-  return rows;
+  return rows.map((r) => ({
+    ...r,
+    ipAllowlistCidrs: (r.ipAllowlistCidrs as string[] | null) ?? [],
+  }));
 }
 
 export async function revokeApiToken(hubId: bigint, tokenId: bigint): Promise<boolean> {

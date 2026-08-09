@@ -6,6 +6,7 @@ import { enqueueProcessDeal } from '../queue/index.js';
 import { liveEmit } from '../lib/liveEmit.js';
 import { writeAudit } from '../lib/audit.js';
 import { logger } from '../lib/logger.js';
+import { compileAllowlist, normaliseClientIp } from '../lib/ipAllowlist.js';
 
 /**
  * Public bearer-token trigger endpoint.
@@ -18,18 +19,8 @@ import { logger } from '../lib/logger.js';
  *   { "payload": { "hs_object_id": 12345, ... } }
  *
  * Auth: per-tenant API tokens (see src/lib/apiTokens.ts). Token maps to
- * exactly one hub_id; no cross-tenant capability.
- *
- * Idempotency: if `Idempotency-Key` header is set, the same key + hub_id
- * dedupes across retries within 7 days. Otherwise a fresh key is derived
- * from (hub_id, deal_id, payload hash) so accidental double-fires from the
- * same JSON body still dedupe.
- *
- * Response: 200 { ok, jobId, duplicate: false }
- *           200 { ok, duplicate: true }  (same idempotency key seen already)
- *           401 { error: 'unauthorized' }
- *           400 { error: 'invalid_payload' }
- *           429 { ... }  (rate limit)
+ * exactly one hub_id; no cross-tenant capability. Optional per-token IP
+ * allow-list (CIDR list) enforced right after auth.
  */
 
 const bodySchema = z.object({
@@ -43,9 +34,6 @@ const TRIGGER_RL = {
   timeWindow: '1 minute',
   keyGenerator: (req: FastifyRequest): string => {
     const auth = req.headers.authorization ?? '';
-    // key by token prefix so limits are per-token; falls back to IP if
-    // the caller forgot the header (they'll get 401 anyway, but this
-    // prevents a bare-request flood from starving legit callers).
     if (auth.startsWith('Bearer phk_')) return `trigger:${auth.slice(7, 19)}`;
     return `trigger:ip:${req.ip}`;
   },
@@ -68,6 +56,33 @@ export function registerApiTriggerRoutes(app: FastifyInstance): void {
         return reply.code(401).send({ error: 'unauthorized' });
       }
 
+      // Per-token IP allow-list. Empty list = no restriction (safe default
+      // for tokens that predate the ip_allowlist_cidrs column).
+      const allowlist = compileAllowlist(token.ipAllowlistCidrs);
+      if (!allowlist.empty) {
+        const clientIp = normaliseClientIp(req.ip);
+        if (!allowlist.contains(clientIp)) {
+          logger.warn(
+            {
+              hubId: token.hubId.toString(),
+              tokenPrefix: token.tokenPrefix,
+              ip: clientIp,
+              requestId: req.requestId,
+            },
+            'api trigger: IP not in allow-list',
+          );
+          await writeAudit({
+            hubId: token.hubId,
+            requestId: req.requestId,
+            kind: 'api.trigger.ip_denied',
+            status: 'error',
+            request: { tokenPrefix: token.tokenPrefix, ip: clientIp },
+            error: 'ip_not_allowed',
+          });
+          return reply.code(403).send({ error: 'ip_not_allowed' });
+        }
+      }
+
       let body: z.infer<typeof bodySchema>;
       try {
         body = bodySchema.parse(req.body);
@@ -80,14 +95,20 @@ export function registerApiTriggerRoutes(app: FastifyInstance): void {
       if (dealIdRaw === undefined || dealIdRaw === null) {
         return reply.code(400).send({ error: 'missing_hs_object_id' });
       }
+      if (
+        typeof dealIdRaw !== 'string' &&
+        typeof dealIdRaw !== 'number' &&
+        typeof dealIdRaw !== 'bigint'
+      ) {
+        return reply.code(400).send({ error: 'bad_hs_object_id' });
+      }
       let dealId: bigint;
       try {
-        dealId = BigInt(String(dealIdRaw));
+        dealId = BigInt(dealIdRaw);
       } catch {
         return reply.code(400).send({ error: 'bad_hs_object_id' });
       }
 
-      // Idempotency: prefer client-supplied key; otherwise derive from body.
       const idemHeader = req.headers['idempotency-key'];
       const rawKeyBytes = Buffer.from(JSON.stringify(body.payload));
       const idemKey =

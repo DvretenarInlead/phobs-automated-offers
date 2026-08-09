@@ -74,6 +74,12 @@ export const tenantConfig = pgTable('tenant_config', {
    *  Shape is defined by src/tenancy/overrides.ts; missing keys use defaults
    *  that preserve legacy behaviour so this column is safe to add empty. */
   overrides: jsonb('overrides').notNull().default(sql`'{}'::jsonb`),
+  /** IP allow-list (array of CIDR strings) for the webhook + workflow-extension
+   *  routes for this tenant. Empty array = no restriction. HMAC/JWT auth still
+   *  applies; this is defence-in-depth. */
+  webhookIpAllowlistCidrs: jsonb('webhook_ip_allowlist_cidrs')
+    .notNull()
+    .default(sql`'[]'::jsonb`),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -217,6 +223,9 @@ export const apiTokens = pgTable(
     name: text('name').notNull(),
     tokenPrefix: text('token_prefix').notNull(),
     tokenHash: text('token_hash').notNull(),
+    /** Per-token IP allow-list (array of CIDR strings). Empty = no restriction.
+     *  Enforced in src/routes/apiTrigger.ts before the token is honoured. */
+    ipAllowlistCidrs: jsonb('ip_allowlist_cidrs').notNull().default(sql`'[]'::jsonb`),
     createdByAdminUserId: bigint('created_by_admin_user_id', { mode: 'bigint' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     lastUsedAt: timestamp('last_used_at', { withTimezone: true }),

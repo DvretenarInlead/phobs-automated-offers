@@ -7,6 +7,9 @@ import { verifyExtensionJwt, extractHubId } from '../hubspot/jwt.js';
 import { claimIdempotencyKey, idempotencyKeyFor } from '../lib/idempotency.js';
 import { enqueueProcessDeal } from '../queue/index.js';
 import { liveEmit } from '../lib/liveEmit.js';
+import { normaliseClientIp } from '../lib/ipAllowlist.js';
+import { loadWebhookAllowlist } from '../tenancy/webhookAllowlist.js';
+import { writeAudit } from '../lib/audit.js';
 import {
   webhookDuplicates,
   webhookSignatureFailures,
@@ -86,8 +89,14 @@ export function registerWebhookRoutes(app: FastifyInstance): void {
           { hubId: portalId.toString(), reason: verdict.reason, requestId: req.requestId },
           'webhook signature verification failed',
         );
-        // Opaque to callers — logs + metrics carry the reason.
         return reply.code(401).send({ error: 'unauthorized' });
+      }
+
+      // Per-tenant IP allow-list (defence-in-depth after HMAC). Empty list =
+      // no restriction. HubSpot fires from AWS ranges; leave empty unless
+      // you're locking down to a specific egress proxy.
+      if (!(await checkTenantIp(portalId, req, 'webhook'))) {
+        return reply.code(403).send({ error: 'ip_not_allowed' });
       }
 
       return handleAccepted(app, reply, {
@@ -121,6 +130,11 @@ export function registerWebhookRoutes(app: FastifyInstance): void {
       }
       if (!hubId) return reply.code(400).send({ error: 'missing_hub_id_claim' });
 
+      // Per-tenant IP allow-list after JWT verification.
+      if (!(await checkTenantIp(hubId, req, 'extension'))) {
+        return reply.code(403).send({ error: 'ip_not_allowed' });
+      }
+
       const rawBody = req.rawBody;
       if (!(rawBody instanceof Buffer)) {
         return reply.code(400).send({ error: 'raw_body_missing' });
@@ -137,6 +151,37 @@ export function registerWebhookRoutes(app: FastifyInstance): void {
   );
 }
 
+async function checkTenantIp(
+  hubId: bigint,
+  req: FastifyRequest,
+  source: 'webhook' | 'extension',
+): Promise<boolean> {
+  const allowlist = await loadWebhookAllowlist(hubId);
+  if (allowlist.empty) return true;
+  const ip = normaliseClientIp(req.ip);
+  if (allowlist.contains(ip)) return true;
+
+  logger.warn(
+    { hubId: hubId.toString(), ip, source, requestId: req.requestId },
+    'tenant IP allow-list rejected request',
+  );
+  liveEmit('webhooks', hubId, {
+    ts: Date.now(),
+    type: 'ip_denied',
+    hubId: hubId.toString(),
+    data: { source, ip },
+  });
+  await writeAudit({
+    hubId,
+    requestId: req.requestId,
+    kind: `${source}.ip_denied`,
+    status: 'error',
+    request: { ip, source },
+    error: 'ip_not_allowed',
+  });
+  return false;
+}
+
 interface AcceptInput {
   hubId: bigint;
   rawBody: Buffer;
@@ -148,8 +193,6 @@ interface AcceptInput {
 async function handleAccepted(app: FastifyInstance, reply: FastifyReply, input: AcceptInput) {
   const parsed = HubSpotPayload.safeParse(input.body);
   if (!parsed.success) {
-    // Log the shape server-side; don't echo it to the caller (it'd help
-    // attackers probe the accepted payload schema).
     app.log.warn(
       { hubId: input.hubId.toString(), detail: parsed.error.format() },
       'webhook rejected: invalid payload',
@@ -162,7 +205,6 @@ async function handleAccepted(app: FastifyInstance, reply: FastifyReply, input: 
 
   const idemKey = idempotencyKeyFor(input.hubId, dealId, input.rawBody);
 
-  // Pre-generate the job id for the idempotency record so duplicates dedupe.
   const provisionalJobId = `${input.hubId.toString()}-${dealId.toString()}-${idemKey.slice(0, 12)}`;
   const fresh = await claimIdempotencyKey(idemKey, provisionalJobId, input.hubId);
   if (!fresh) {

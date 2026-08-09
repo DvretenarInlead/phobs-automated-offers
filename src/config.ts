@@ -33,6 +33,11 @@ const envSchema = z.object({
   REDIS_URL: z.string().url(),
 
   ADMIN_IP_ALLOWLIST: z.string().optional().default(''),
+
+  // How many trusted proxies terminate in front of the app. On DO App Platform
+  // there's exactly one edge LB, so 1 is correct. Higher values let X-Forwarded-For
+  // spoofing through — never use `true` in production.
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(10).default(1),
 });
 
 export type AppConfig = z.infer<typeof envSchema> & {

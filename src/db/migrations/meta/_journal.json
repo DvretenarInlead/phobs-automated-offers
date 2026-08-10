@@ -8,6 +8,27 @@
       "when": 1778827162523,
       "tag": "0000_lean_the_captain",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1786263345186,
+      "tag": "0001_unique_kronos",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786269800000,
+      "tag": "0002_api_tokens",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786269900000,
+      "tag": "0003_ip_allowlist",
+      "breakpoints": true
     }
   ]
 }

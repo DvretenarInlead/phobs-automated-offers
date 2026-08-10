@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
-import { useParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '../lib/api';
 import { RateFiltersEditor } from '../components/RateFiltersEditor';
 import type { RateFilters } from '../components/RateFiltersEditor';
+import { CidrListEditor } from '../components/CidrListEditor';
 
 interface ConfigResponse {
   hubId: string;
@@ -344,7 +345,115 @@ export function TenantConfig(): ReactElement {
         <h2 className="font-semibold mb-4">Rate filters</h2>
         <RateFiltersEditor value={rateFilters} onChange={setRateFilters} />
       </section>
+
+      <WebhookAllowlistSection hubId={hubId!} />
+
+      <section className="card">
+        <h2 className="font-semibold mb-2">API tokens</h2>
+        <p className="text-sm text-slate-400 mb-3">
+          Manage bearer tokens used by external integrations calling{' '}
+          <code className="font-mono">POST /api/trigger</code>, and their per-token IP
+          allow-lists.
+        </p>
+        <Link
+          to={`/tenants/${hubId!}/api-tokens`}
+          className="text-emerald-400 hover:text-emerald-300 text-sm"
+        >
+          Manage API tokens →
+        </Link>
+      </section>
     </div>
+  );
+}
+
+interface WebhookAllowlistResponse {
+  webhook_ip_allowlist_cidrs: string[];
+}
+
+function WebhookAllowlistSection({ hubId }: { hubId: string }): ReactElement {
+  const qc = useQueryClient();
+  const q = useQuery({
+    queryKey: ['webhook-allowlist', hubId],
+    queryFn: () => api<WebhookAllowlistResponse>(`/tenants/${hubId}/webhook-allowlist`),
+  });
+  const [cidrs, setCidrs] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<Date | null>(null);
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    if (q.data && !hydrated) {
+      setCidrs(q.data.webhook_ip_allowlist_cidrs);
+      setHydrated(true);
+    }
+  }, [q.data, hydrated]);
+
+  const save = useMutation({
+    mutationFn: (): Promise<{ ok: true }> =>
+      api(`/tenants/${hubId}/webhook-allowlist`, {
+        method: 'PUT',
+        body: { webhook_ip_allowlist_cidrs: cidrs },
+      }),
+    onSuccess: async () => {
+      setError(null);
+      setSavedAt(new Date());
+      await qc.invalidateQueries({ queryKey: ['webhook-allowlist', hubId] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError) {
+        const detail = err.detail as { invalid?: string[] } | null;
+        if (err.message === 'invalid_cidrs' && detail?.invalid?.length) {
+          setError(`Invalid entries: ${detail.invalid.join(', ')}`);
+          return;
+        }
+        setError(err.message);
+        return;
+      }
+      setError('save_failed');
+    },
+  });
+
+  return (
+    <section className="card">
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="font-semibold">HubSpot webhook IP allow-list</h2>
+        <div className="flex items-center gap-3">
+          {savedAt && (
+            <span className="text-emerald-400 text-xs">
+              Saved {savedAt.toLocaleTimeString()}
+            </span>
+          )}
+          {error && <span className="text-rose-400 text-xs">{error}</span>}
+          <button
+            type="button"
+            className="btn-primary text-xs"
+            disabled={save.isPending || !hydrated}
+            onClick={() => save.mutate()}
+          >
+            {save.isPending ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+      <p className="text-sm text-slate-400 mb-3">
+        Restrict which client IPs may hit{' '}
+        <code className="font-mono">POST /webhooks/hubspot/{hubId}</code> and{' '}
+        <code className="font-mono">POST /workflow-actions/process-deal</code> for this
+        tenant. HubSpot fires from AWS ranges — leave empty unless you've fronted us with a
+        fixed-IP egress proxy. HMAC/JWT verification still runs first; this is
+        defence-in-depth.
+      </p>
+      {q.isPending ? (
+        <div className="text-slate-500 text-sm">Loading…</div>
+      ) : q.error ? (
+        <div className="text-rose-400 text-sm">Failed to load allow-list.</div>
+      ) : (
+        <CidrListEditor
+          value={cidrs}
+          onChange={setCidrs}
+          emptyHint="No entries — any IP that passes HMAC/JWT is accepted."
+        />
+      )}
+    </section>
   );
 }
 

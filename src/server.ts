@@ -22,9 +22,13 @@ import { registerAdminApiRoutes } from './routes/adminApi.js';
 import { registerAdminUserRoutes } from './routes/adminUsers.js';
 import { registerAdminLiveRoutes } from './routes/adminLive.js';
 import { registerAdminJobsRoutes } from './routes/adminJobs.js';
+import { registerAdminApiTokenRoutes } from './routes/adminApiTokens.js';
+import { registerApiTriggerRoutes } from './routes/apiTrigger.js';
 import { registerAdminAuthHook } from './admin/auth.js';
 import { registerMetricsRoute, httpRequestDuration, httpRequestsTotal } from './metrics/index.js';
 import { makeRedis } from './queue/index.js';
+import { AppError } from './lib/errors.js';
+import { ZodError } from 'zod';
 
 const config = loadConfig();
 const ADMIN_API_PREFIX = '/api/admin';
@@ -42,7 +46,11 @@ async function buildApp() {
         censor: '[REDACTED]',
       },
     },
-    trustProxy: true,
+    // Trust exactly the number of proxy hops in front of the app (DO App
+    // Platform terminates TLS at 1 hop). `true` here would let any client
+    // spoof req.ip via X-Forwarded-For and bypass the admin IP allow-list,
+    // login-lockout, and metrics localhost fallback.
+    trustProxy: config.TRUST_PROXY_HOPS,
     bodyLimit: 1_000_000,
     disableRequestLogging: false,
     genReqId: () => randomUUID(),
@@ -55,15 +63,26 @@ async function buildApp() {
       directives: {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'"],
+        // Tailwind emits utility classes as static CSS; the SPA never inlines
+        // styles at runtime. `'unsafe-inline'` is here only for pragmatic
+        // compatibility with third-party components in dev. Drop it if the
+        // SPA passes a run without inline <style> after `npm run build:ui`.
         styleSrc: ["'self'", "'unsafe-inline'"],
         imgSrc: ["'self'", 'data:'],
         connectSrc: ["'self'"],
+        fontSrc: ["'self'", 'data:'],
         objectSrc: ["'none'"],
+        frameSrc: ["'none'"],
         frameAncestors: ["'none'"],
+        baseUri: ["'none'"],
+        formAction: ["'self'"],
+        upgradeInsecureRequests: [],
       },
     },
     hsts: { maxAge: 63_072_000, includeSubDomains: true, preload: true },
     referrerPolicy: { policy: 'no-referrer' },
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    crossOriginResourcePolicy: { policy: 'same-origin' },
   });
 
   await app.register(rateLimit, {
@@ -96,9 +115,11 @@ async function buildApp() {
   registerMetricsRoute(app);
   registerWebhookRoutes(app);
   registerOAuthRoutes(app);
+  registerApiTriggerRoutes(app);
   registerAdminAuthRoutes(app, ADMIN_API_PREFIX);
   registerAdminUserRoutes(app, ADMIN_API_PREFIX);
   registerAdminApiRoutes(app, ADMIN_API_PREFIX);
+  registerAdminApiTokenRoutes(app, ADMIN_API_PREFIX);
   registerAdminJobsRoutes(app, ADMIN_API_PREFIX);
   registerAdminLiveRoutes(app, ADMIN_API_PREFIX);
 
@@ -128,16 +149,32 @@ async function buildApp() {
     );
   }
 
-  app.setErrorHandler((err: Error & { statusCode?: number }, req, reply) => {
+  // Only surface error messages for types we own; everything else is opaque
+  // to prevent leaking stack traces, upstream response bodies, Zod tree
+  // dumps, or DB-driver messages like "duplicate key value violates unique
+  // constraint" (which is a working oracle for user enumeration).
+  app.setErrorHandler((err: Error & { statusCode?: number; validation?: unknown }, req, reply) => {
     req.log.error({ err }, 'request failed');
-    const statusCode = err.statusCode ?? 500;
-    return reply.code(statusCode).send({ error: err.message });
+    if (err instanceof AppError) {
+      return reply.code(err.statusCode).send({ error: err.code, message: err.message });
+    }
+    if (err instanceof ZodError) {
+      return reply.code(400).send({ error: 'invalid_payload', requestId: req.requestId });
+    }
+    // Fastify's own validation errors carry `validation` and `statusCode: 400`.
+    if (err.validation) {
+      return reply.code(400).send({ error: 'invalid_payload', requestId: req.requestId });
+    }
+    if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+      return reply.code(err.statusCode).send({ error: 'client_error', requestId: req.requestId });
+    }
+    return reply.code(500).send({ error: 'internal_error', requestId: req.requestId });
   });
 
   return app;
 }
 
-async function start() {
+async function start(): Promise<void> {
   try {
     const app = await buildApp();
     await app.listen({ host: '0.0.0.0', port: config.PORT });
@@ -147,5 +184,14 @@ async function start() {
     process.exit(1);
   }
 }
+
+// Prevent asynchronous errors from silently degrading the process.
+process.on('unhandledRejection', (reason) => {
+  logger.error({ err: reason }, 'unhandledRejection');
+});
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaughtException — exiting');
+  process.exit(1);
+});
 
 void start();

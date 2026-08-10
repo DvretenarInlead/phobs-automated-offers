@@ -36,6 +36,13 @@ export function verifyCsrfToken(token: string): boolean {
   return safeEquals(sig, expected);
 }
 
+// Domain-separator prefix so a CSRF signature can never be confused with an
+// OAuth-state signature or an invite-token signature (all three sign against
+// sessionSecret). Every consumer must use its own prefix.
+const CSRF_HMAC_DOMAIN = 'csrf|';
+
 function sign(input: string): string {
-  return createHmac('sha256', config.sessionSecret).update(input).digest('base64url');
+  return createHmac('sha256', config.sessionSecret)
+    .update(CSRF_HMAC_DOMAIN + input)
+    .digest('base64url');
 }

@@ -9,10 +9,10 @@
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
-import { Resource } from '@opentelemetry/resources';
+import { resourceFromAttributes } from '@opentelemetry/resources';
 import {
-  SEMRESATTRS_SERVICE_NAME,
-  SEMRESATTRS_SERVICE_VERSION,
+  ATTR_SERVICE_NAME,
+  ATTR_SERVICE_VERSION,
 } from '@opentelemetry/semantic-conventions';
 
 const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim();
@@ -21,9 +21,9 @@ let sdk: NodeSDK | null = null;
 
 if (endpoint) {
   sdk = new NodeSDK({
-    resource: new Resource({
-      [SEMRESATTRS_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? 'phobs-automated-offers',
-      [SEMRESATTRS_SERVICE_VERSION]: process.env.npm_package_version ?? '0.0.0',
+    resource: resourceFromAttributes({
+      [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? 'phobs-automated-offers',
+      [ATTR_SERVICE_VERSION]: process.env.npm_package_version ?? '0.0.0',
     }),
     traceExporter: new OTLPTraceExporter({
       url: `${endpoint.replace(/\/+$/, '')}/v1/traces`,

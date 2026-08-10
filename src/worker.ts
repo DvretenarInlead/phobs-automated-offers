@@ -19,17 +19,38 @@ const worker = makeWorker(async (job) => {
   }
 });
 
+// Worker-level errors (Redis stalls, connection resets, malformed job data)
+// arrive asynchronously and would otherwise become unhandled rejections.
+worker.on('error', (err) => {
+  logger.error({ err }, 'BullMQ worker error');
+});
+
 // Ensure the daily rollup is scheduled. Safe to call repeatedly.
 scheduleDailyRollup().catch((err: unknown) => {
   logger.warn({ err }, 'failed to schedule daily rollup');
 });
 
-async function shutdown(signal: string) {
+async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'worker shutting down');
-  await worker.close();
+  try {
+    await worker.close();
+  } catch (err) {
+    logger.error({ err }, 'worker close failed');
+  }
   process.exit(0);
 }
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT', () => void shutdown('SIGINT'));
+
+// Never let an unhandled rejection quietly poison the process.
+process.on('unhandledRejection', (reason) => {
+  logger.error({ err: reason }, 'unhandledRejection');
+});
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaughtException — exiting');
+  // Uncaught exceptions leave the process in an unknown state; let the
+  // orchestrator restart us cleanly.
+  process.exit(1);
+});
 
 logger.info('worker started');

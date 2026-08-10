@@ -4,6 +4,7 @@ import { makeRedis } from '../queue/index.js';
 import { requireRole } from '../admin/auth.js';
 import { liveChannelKey } from '../lib/liveEmit.js';
 import type { LiveChannel } from '../lib/liveEmit.js';
+import { acquireSseSlot, releaseSseSlot } from '../admin/rateLimit.js';
 import { logger } from '../lib/logger.js';
 
 const MAX_EVENTS_PER_SECOND = 500;
@@ -25,7 +26,21 @@ export function registerAdminLiveRoutes(app: FastifyInstance, prefix = '/api/adm
         return reply.code(403).send({ error: 'cross_tenant_denied' });
       }
 
-      await streamSse(reply, req, liveChannelKey(channel, hubId));
+      // Cap concurrent SSE connections per admin user. Each connection opens
+      // a dedicated ioredis subscriber and holds an HTTP socket open, so an
+      // attacker with a valid session could otherwise exhaust FDs / Redis
+      // client slots by opening thousands of parallel tabs.
+      const adminUserId = req.adminUser!.id;
+      const acquired = await acquireSseSlot(adminUserId);
+      if (!acquired.ok) {
+        return reply.code(429).send({ error: 'too_many_sse_connections' });
+      }
+
+      try {
+        await streamSse(reply, req, liveChannelKey(channel, hubId));
+      } finally {
+        await releaseSseSlot(adminUserId);
+      }
     };
 
   app.get(

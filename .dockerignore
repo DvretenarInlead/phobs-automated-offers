@@ -1,0 +1,35 @@
+.git
+.gitignore
+.gitattributes
+.github
+
+.env
+.env.*
+!.env.example
+
+node_modules
+dist
+coverage
+*.log
+
+.vscode
+.idea
+.DS_Store
+
+test
+web/src/**/*.test.ts
+src/**/*.test.ts
+vitest.config.ts
+
+# Local infra + docs never needed inside the image
+docker-compose.yml
+.do
+README.md
+ARCHITECTURE.md
+RUNBOOK.md
+do-functions
+
+# Scratchpads / editor tmp
+tmp
+scratchpad
+*.swp

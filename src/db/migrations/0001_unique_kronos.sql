@@ -1,0 +1,1 @@
+ALTER TABLE "tenant_config" ADD COLUMN "overrides" jsonb DEFAULT '{}'::jsonb NOT NULL;

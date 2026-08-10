@@ -21,12 +21,12 @@ import {
   verifyCsrfToken,
 } from '../admin/csrf.js';
 import {
-  LOGIN_LOCKOUT_THRESHOLD,
-  bumpLoginAttempt,
-  resetLoginAttempts,
+  LOGIN_HARD_LOCK,
+  applyLoginBackoff,
+  bumpLoginFailure,
+  resetLoginFailures,
 } from '../admin/rateLimit.js';
 import { writeAdminAudit } from '../admin/audit.js';
-import { setTimeout as delay } from 'node:timers/promises';
 
 const COOKIE_BASE = {
   path: '/',
@@ -50,24 +50,45 @@ const loginSchema = z.object({
   recoveryCode: z.string().min(8).max(64).optional(),
 });
 
-export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/admin'): void {
-  app.get(`${prefix}/csrf`, (_req, reply) => {
-    const token = issueCsrfToken();
-    void reply
-      .setCookie(csrfCookieName, token, { ...COOKIE_CSRF, maxAge: 60 * 60 * 24 })
-      .send({ csrfToken: token, headerName: csrfHeaderName });
-  });
+// Per-route HTTP rate limits — keyed by req.ip after trustProxy honours the
+// exact hop count (see src/config.ts:TRUST_PROXY_HOPS). These are the
+// per-IP flood ceiling. Per-account (email) throttling is separate and lives
+// in bumpLoginFailure + progressiveDelayMs.
+const LOGIN_RL = { max: 20, timeWindow: '1 minute' };
+const CSRF_RL = { max: 60, timeWindow: '1 minute' };
+const INVITE_ACCEPT_RL = { max: 10, timeWindow: '1 minute' };
 
-  app.post(`${prefix}/login`, async (req, reply) => {
+export const rateLimits = { LOGIN_RL, CSRF_RL, INVITE_ACCEPT_RL };
+
+export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/admin'): void {
+  app.get(
+    `${prefix}/csrf`,
+    { config: { rateLimit: CSRF_RL } },
+    (_req, reply) => {
+      const token = issueCsrfToken();
+      void reply
+        .setCookie(csrfCookieName, token, { ...COOKIE_CSRF, maxAge: 60 * 60 * 24 })
+        .send({ csrfToken: token, headerName: csrfHeaderName });
+    },
+  );
+
+  app.post(
+    `${prefix}/login`,
+    { config: { rateLimit: LOGIN_RL } },
+    async (req, reply) => {
     const start = Date.now();
     const body = loginSchema.parse(req.body);
-    const key = `${body.email}|${req.ip}`;
-    const fails = await bumpLoginAttempt(key);
-    if (fails > LOGIN_LOCKOUT_THRESHOLD) {
-      // Constant-time-ish delay
-      await delay(200);
+
+    // Per-account (email) failure counter — independent of req.ip so a shared
+    // corporate NAT can't self-lock. `applyLoginBackoff` inserts a growing
+    // delay after each failure to slow bots down without hard-locking real
+    // users. Hard lock only kicks in at LOGIN_HARD_LOCK failures/hour.
+    const failsSoFar = await bumpLoginFailure(body.email);
+    if (failsSoFar > LOGIN_HARD_LOCK) {
+      logger.warn({ email: body.email, ip: req.ip, fails: failsSoFar }, 'login hard-locked');
       throw new AuthError('locked');
     }
+    await applyLoginBackoff(failsSoFar - 1);
 
     // CSRF check on login too (cookie may be absent first time; in that case
     // the client should hit /csrf before login)
@@ -126,7 +147,7 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
       }
     }
 
-    await resetLoginAttempts(key);
+    await resetLoginFailures(body.email);
     await db
       .update(adminUsers)
       .set({ lastLoginAt: new Date() })
@@ -157,7 +178,8 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
         },
         csrfToken: csrf,
       });
-  });
+  },
+  );
 
   app.post(`${prefix}/logout`, async (req, reply) => {
     const sid = req.cookies?.[SESSION_COOKIE_NAME];
@@ -172,7 +194,21 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
         });
       }
     }
-    return reply.clearCookie(SESSION_COOKIE_NAME, { path: '/' }).send({ ok: true });
+    // __Host- prefix requires the full attribute set on deletion in some UAs.
+    return reply
+      .clearCookie(SESSION_COOKIE_NAME, {
+        path: '/',
+        httpOnly: true,
+        secure: true,
+        sameSite: 'strict',
+      })
+      .clearCookie(csrfCookieName, {
+        path: '/',
+        httpOnly: false,
+        secure: true,
+        sameSite: 'strict',
+      })
+      .send({ ok: true });
   });
 
   app.get(`${prefix}/me`, (req, reply) => {

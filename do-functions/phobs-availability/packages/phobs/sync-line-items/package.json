@@ -1,0 +1,10 @@
+{
+  "name": "phobs-sync-line-items",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DO Function: Phobs availability sync + HubSpot line-item creation for a deal.",
+  "main": "index.js",
+  "dependencies": {
+    "fast-xml-parser": "^4.5.0"
+  }
+}

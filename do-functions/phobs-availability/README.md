@@ -1,30 +1,38 @@
-# Phobs availability probe — DigitalOcean Function
+# Phobs DigitalOcean Functions
 
-A **self-contained** Node.js handler that queries a Phobs
-`PCPropertyAvailabilityRQ` endpoint and returns the parsed response as JSON.
-Zero coupling to the main service — no DB, no queue, no HubSpot. Handy for
-isolating Phobs integration issues.
+Two **self-contained** Node.js webhook handlers, deployed together as one DO
+Functions project:
 
-Credentials (`PHOBS_ENDPOINT`, `PHOBS_SITE_ID`, `PHOBS_USERNAME`,
-`PHOBS_PASSWORD`) live in the function's **environment**, never in the
-request body or response.
+| Action | What it does |
+| --- | --- |
+| `phobs/availability` | Read-only probe: queries Phobs `PCPropertyAvailabilityRQ`, returns the parsed rates as JSON. No HubSpot. |
+| `phobs/sync-line-items` | Availability sync + writes: queries Phobs, picks the best offers, **upserts HubSpot products and creates line items on a deal**. No quote (see `standalone/quote-runner` for that). |
+
+Credentials (`PHOBS_*`, `HUBSPOT_ACCESS_TOKEN`) live in the function's
+**environment**, never in the request body or response.
 
 ## Layout
 
 ```
 phobs-availability/
-├── project.yml                                # DO Functions project spec
+├── project.yml                                # DO Functions project spec (both actions)
 ├── .env.example                               # copy to .env, fill, deploy
-└── packages/phobs/availability/
-    ├── index.js                               # the handler
-    ├── package.json                           # only dep: fast-xml-parser
-    └── example-input.json                     # only the query params, no creds
+└── packages/phobs/
+    ├── availability/
+    │   ├── index.js                           # read-only probe handler
+    │   ├── package.json                       # only dep: fast-xml-parser
+    │   └── example-input.json
+    └── sync-line-items/
+        ├── index.js                           # availability → products → line items
+        ├── package.json                       # only dep: fast-xml-parser
+        └── example-input.json
 ```
 
-Once deployed the action is at:
+Once deployed the actions are at:
 
 ```
 POST https://<namespace>.doserverless.co/api/v1/web/fn-<id>/phobs/availability
+POST https://<namespace>.doserverless.co/api/v1/web/fn-<id>/phobs/sync-line-items
 ```
 
 ## Local testing (before deploy)
@@ -151,6 +159,92 @@ it impossible to override credentials by injecting them via query string.
 - `statusCode: 200` — Phobs answered; `body.ok` reflects `<ResponseType><Success/>`
 - `statusCode: 400` — input validation failed; `body.details` lists missing / bad fields (env vars named explicitly if not set)
 - `statusCode: 502` — network error, upstream 4xx/5xx, or unparseable XML
+
+## phobs/sync-line-items — webhook that creates line items
+
+Everything above describes the read-only `availability` probe. The
+`sync-line-items` action shares the same Phobs input fields and adds a HubSpot
+write leg: after fetching availability it drops zero-availability /
+zero-price rows, sorts by price ascending, caps at `maxResults`, then for
+each remaining offer upserts a product (`hs_sku` =
+`propertyId:unitId:rateId`) and creates a line item associated to `dealId`.
+Finally it writes `phobs_availability_status` (`available` /
+`no_availability`) back to the deal (disable with env
+`WRITEBACK_STATUS=false`).
+
+### Webhook payload
+
+```json
+{
+  "dealId": "12345678901",
+  "propertyId": "P1",
+  "checkInDate": "2026-07-20",
+  "nights": 5,
+  "adults": 2,
+  "childAges": [8, 3],
+  "unitIds": ["17173", "17174"],
+  "accessCode": "LOY-42",
+  "lang": "en",
+  "maxResults": 5
+}
+```
+
+Required: `dealId`, `propertyId`, `checkInDate`, `nights`, `adults`.
+Optional: `childAges`, `unitIds`, `accessCode`, `lang`, `includeRestricted`,
+`maxResults`, `timeoutMs`.
+
+### Invoke
+
+```bash
+URL=$(doctl serverless functions get phobs/sync-line-items --url)
+curl -sS -X POST "$URL" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H 'content-type: application/json' \
+  -d @packages/phobs/sync-line-items/example-input.json | jq
+```
+
+### Response
+
+```json
+{
+  "ok": true,
+  "dealId": "12345678901",
+  "rates": { "found": 12, "selected": 3 },
+  "lineItems": [
+    {
+      "id": "9876543210",
+      "productId": "555",
+      "productCreated": false,
+      "sku": "P1:17173:RATE525802",
+      "name": "Obiteljska soba plus — Posebna cijena",
+      "quantity": 5,
+      "pricePerNight": 620.21,
+      "stayTotal": 3101.05,
+      "currency": "EUR",
+      "board": "HB",
+      "unitId": "17173",
+      "rateId": "RATE525802"
+    }
+  ],
+  "latencyMs": 5210
+}
+```
+
+No availability → `200` with `"outcome": "no_availability"` and an empty
+`lineItems` array. HubSpot failures → `502` with `createdLineItems` listing
+whatever was created before the failure (calls are sequential, so a partial
+run is visible, not silent).
+
+### Auth + extra env
+
+Set `API_TOKEN` in the function env and every call must carry
+`Authorization: Bearer <API_TOKEN>` (timing-safe comparison; `401` otherwise).
+`HUBSPOT_ACCESS_TOKEN` must be a Private App token with scopes:
+`crm.objects.deals.write`, `crm.objects.products.read/write`,
+`crm.objects.line_items.write`, `e-commerce`.
+
+Note: there is no idempotency — firing the webhook twice for the same deal
+creates a second set of line items.
 
 ## Security notes
 

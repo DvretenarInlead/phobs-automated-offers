@@ -19,6 +19,8 @@ packages:
       PHOBS_SITE_ID: ${PHOBS_SITE_ID}
       PHOBS_USERNAME: ${PHOBS_USERNAME}
       PHOBS_PASSWORD: ${PHOBS_PASSWORD}
+      HUBSPOT_ACCESS_TOKEN: ${HUBSPOT_ACCESS_TOKEN}
+      API_TOKEN: ${API_TOKEN}
     annotations: {}
     actions:
       - name: availability
@@ -29,4 +31,13 @@ packages:
         webSecure: false         # set true + require-auth header to gate
         limits:
           timeout: 30000         # ms; Phobs sometimes takes ~10s
+          memory: 256            # MB
+      - name: sync-line-items
+        binary: false
+        main: 'main'
+        runtime: 'nodejs:18'
+        web: true                # webhook URL — POST the JSON payload here
+        webSecure: false         # auth is handled by API_TOKEN (Bearer) instead
+        limits:
+          timeout: 60000         # ms; Phobs + N HubSpot calls can take a while
           memory: 256            # MB

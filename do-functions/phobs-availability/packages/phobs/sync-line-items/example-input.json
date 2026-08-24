@@ -1,0 +1,12 @@
+{
+  "dealId": "12345678901",
+  "propertyId": "P1",
+  "checkInDate": "2026-07-20",
+  "nights": 5,
+  "adults": 2,
+  "childAges": [8, 3],
+  "unitIds": ["17173", "17174"],
+  "accessCode": "LOY-42",
+  "lang": "en",
+  "maxResults": 5
+}

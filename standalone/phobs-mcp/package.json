@@ -1,0 +1,18 @@
+{
+  "name": "phobs-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MCP server exposing Phobs availability (PCPropertyAvailabilityRQ), price quotes (PCPriceQuoteRQ), and HubSpot line-item sync as tools.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "main": "server.js",
+  "bin": { "phobs-mcp": "server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "fast-xml-parser": "^4.5.0",
+    "zod": "^3.24.0"
+  }
+}

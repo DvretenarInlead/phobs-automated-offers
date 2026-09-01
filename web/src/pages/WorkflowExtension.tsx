@@ -1,18 +1,19 @@
 import { useState } from 'react';
 import type { ReactElement } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { api } from '../lib/api';
+import { api, describeError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 
 export function WorkflowExtension(): ReactElement {
   const { user } = useAuth();
-  if (user?.role !== 'superadmin') {
-    return <div className="text-rose-400 text-sm">Superadmin only.</div>;
-  }
+  const isSuper = user?.role === 'superadmin';
 
+  // Hooks always run in the same order — the role guard is applied to the
+  // query (enabled) and the render, never by returning early above a hook.
   const q = useQuery({
     queryKey: ['workflow-action-definition'],
     queryFn: () => api<Record<string, unknown>>('/workflow-action-definition'),
+    enabled: isSuper,
   });
 
   const [copied, setCopied] = useState(false);
@@ -23,6 +24,10 @@ export function WorkflowExtension(): ReactElement {
     setTimeout(() => setCopied(false), 1500);
   };
 
+  if (!isSuper) {
+    return <div className="text-rose-400 text-sm">Superadmin only.</div>;
+  }
+
   return (
     <div className="space-y-4">
       <h1 className="text-2xl font-semibold">HubSpot Workflow Extension</h1>
@@ -30,7 +35,7 @@ export function WorkflowExtension(): ReactElement {
         Once your HubSpot public app is created, register this definition as a
         custom workflow action so it appears in every installed portal's
         workflow builder, scoped to deals. HubSpot will invoke{' '}
-        <code className="text-emerald-300">{q.data?.actionUrl as string}</code>{' '}
+        <code className="text-emerald-300">{(q.data?.actionUrl as string | undefined) ?? '…'}</code>{' '}
         with a signed JWT in the Authorization header per execution.
       </p>
 
@@ -75,14 +80,18 @@ export function WorkflowExtension(): ReactElement {
           <h2 className="font-semibold">Definition</h2>
           <div className="flex items-center gap-3">
             {copied && <span className="text-emerald-400 text-xs">Copied!</span>}
-            <button className="btn-secondary text-xs" onClick={copy} disabled={!q.data}>
+            <button type="button" className="btn-secondary text-xs" onClick={copy} disabled={!q.data}>
               Copy JSON
             </button>
           </div>
         </div>
-        <pre className="font-mono text-xs bg-slate-950 rounded p-3 overflow-x-auto max-h-[60vh]">
-          {q.data ? JSON.stringify(q.data, null, 2) : 'Loading…'}
-        </pre>
+        {q.error ? (
+          <div className="text-rose-400 text-sm">{describeError(q.error, 'Failed to load definition.')}</div>
+        ) : (
+          <pre className="font-mono text-xs bg-slate-950 rounded p-3 overflow-x-auto max-h-[60vh]">
+            {q.data ? JSON.stringify(q.data, null, 2) : 'Loading…'}
+          </pre>
+        )}
       </section>
     </div>
   );

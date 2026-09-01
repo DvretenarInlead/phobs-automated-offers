@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ReactElement } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { api } from '../lib/api';
+import { api, describeError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 
 interface TenantsResponse {
@@ -32,10 +32,10 @@ export function Activity(): ReactElement {
   });
   const [hubId, setHubId] = useState<string>(user?.scopedHubId ?? '');
 
-  // Default to the only tenant when one becomes available
-  if (!hubId && tenantsQ.data?.tenants[0]) {
-    setHubId(tenantsQ.data.tenants[0].hubId);
-  }
+  // Default to the first tenant once the list arrives.
+  useEffect(() => {
+    if (!hubId && tenantsQ.data?.tenants[0]) setHubId(tenantsQ.data.tenants[0].hubId);
+  }, [hubId, tenantsQ.data]);
 
   const auditQ = useQuery({
     queryKey: ['audit', hubId],
@@ -51,6 +51,7 @@ export function Activity(): ReactElement {
         {user?.role === 'superadmin' && tenantsQ.data && (
           <select
             className="input max-w-xs"
+            aria-label="Tenant"
             value={hubId}
             onChange={(e) => setHubId(e.target.value)}
           >
@@ -64,8 +65,18 @@ export function Activity(): ReactElement {
       </div>
 
       <section className="card overflow-hidden">
-        {auditQ.isPending ? (
+        {tenantsQ.error ? (
+          <div className="text-rose-400 text-sm">Failed to load tenants.</div>
+        ) : !hubId ? (
+          tenantsQ.isPending ? (
+            <div className="text-slate-500 text-sm">Loading…</div>
+          ) : (
+            <div className="text-slate-500 text-sm">No tenants installed yet.</div>
+          )
+        ) : auditQ.isPending ? (
           <div className="text-slate-500 text-sm">Loading…</div>
+        ) : auditQ.error ? (
+          <div className="text-rose-400 text-sm">{describeError(auditQ.error, 'Failed to load activity.')}</div>
         ) : (
           <table className="table">
             <thead>
@@ -79,7 +90,7 @@ export function Activity(): ReactElement {
               </tr>
             </thead>
             <tbody>
-              {auditQ.data?.items.map((row) => (
+              {auditQ.data.items.map((row) => (
                 <tr key={row.id}>
                   <td className="text-slate-400">
                     {new Date(row.createdAt).toLocaleString()}
@@ -94,12 +105,12 @@ export function Activity(): ReactElement {
                   <td className="text-slate-400">
                     {row.latencyMs != null ? `${row.latencyMs} ms` : ''}
                   </td>
-                  <td className="text-rose-400 text-xs truncate max-w-md">
+                  <td className="text-rose-400 text-xs truncate max-w-md" title={row.error ?? ''}>
                     {row.error ?? ''}
                   </td>
                 </tr>
               ))}
-              {auditQ.data && auditQ.data.items.length === 0 && (
+              {auditQ.data.items.length === 0 && (
                 <tr>
                   <td colSpan={6} className="text-center text-slate-500 py-6">
                     No activity yet.

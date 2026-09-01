@@ -4,27 +4,36 @@ import type { Redis } from 'ioredis';
 
 let r: Redis | null = null;
 function redis(): Redis {
-  if (!r) r = makeRedis();
+  // Request-path client: fail fast on a Redis outage rather than hang logins.
+  if (!r) r = makeRedis({ failFast: true });
   return r;
 }
 
-// Sliding-window counter helpers. Failure counters are keyed by *email* alone
-// so a shared corporate NAT (many users behind one IP) can't get self-locked
-// by another employee typo-ing their password. Per-IP flood protection lives
-// at the Fastify @fastify/rate-limit layer on the login route itself.
+// Login throttling, two layers:
 //
-// Two thresholds:
-//   * SOFT — kicks in progressive delays (100ms → up to ~4s) but still lets
-//     the correct password through. Protects against automated stuffing.
-//   * HARD — full lock, requires admin unlock or 24h expiry. Very high so
-//     an attacker who knows the email cannot casually deny service.
+//   * SOFT (per email): progressive delays (100ms → ~4s) after a few failed
+//     attempts. Still lets the correct password through, so a shared
+//     corporate NAT can't lock a colleague out. Slows credential stuffing.
+//   * HARD (per email + client IP): full lock for the window. Scoped to the
+//     IP so an attacker who merely knows an admin's email cannot lock the
+//     real admin out from their own network. Superadmins can clear it from
+//     the Users page (POST /users/:id/unlock).
+//
+// Counters are bumped only on an actual failed credential/MFA check, never on
+// requests that fail CSRF or validation — those can't be used to lock anyone.
 
 export const LOGIN_SOFT_LIMIT = 5;
-export const LOGIN_HARD_LOCK = 50;
+export const LOGIN_HARD_LOCK = 25;
 export const LOGIN_WINDOW_SEC = 60 * 60; // 1 h
 
-async function bump(kind: string, subject: string, windowSec: number): Promise<number> {
-  const k = `${kind}:${subject}`;
+function softKey(email: string): string {
+  return `login:fail:${email.toLowerCase()}`;
+}
+function hardKey(email: string, ip: string): string {
+  return `login:hardfail:${email.toLowerCase()}:${ip}`;
+}
+
+async function bump(k: string, windowSec: number): Promise<number> {
   const tx = redis().multi();
   tx.incr(k);
   tx.expire(k, windowSec, 'NX');
@@ -33,21 +42,53 @@ async function bump(kind: string, subject: string, windowSec: number): Promise<n
   return typeof first === 'number' ? first : Number(first ?? 0);
 }
 
-async function reset(kind: string, subject: string): Promise<void> {
-  await redis().del(`${kind}:${subject}`);
+async function get(k: string): Promise<number> {
+  const v = await redis().get(k);
+  return v ? Number(v) : 0;
+}
+
+/** Current failure counts for an account before an attempt is evaluated. */
+export async function getLoginFailures(
+  email: string,
+  ip: string,
+): Promise<{ soft: number; hard: number }> {
+  const [soft, hard] = await Promise.all([get(softKey(email)), get(hardKey(email, ip))]);
+  return { soft, hard };
+}
+
+/** Records a failed login. Returns the updated counts. */
+export async function bumpLoginFailure(
+  email: string,
+  ip: string,
+): Promise<{ soft: number; hard: number }> {
+  const [soft, hard] = await Promise.all([
+    bump(softKey(email), LOGIN_WINDOW_SEC),
+    bump(hardKey(email, ip), LOGIN_WINDOW_SEC),
+  ]);
+  return { soft, hard };
+}
+
+/** Clears the soft counter after a successful login (hard counters for other IPs stay). */
+export async function resetLoginFailures(email: string, ip?: string): Promise<void> {
+  await redis().del(softKey(email));
+  if (ip) await redis().del(hardKey(email, ip));
 }
 
 /**
- * Records a failed login for an account (identified by lowercased email).
- * Returns the new failure count. Caller applies progressive delay + hard-lock
- * check based on the returned value.
+ * Superadmin unlock: clears the soft counter and every hard-lock counter for
+ * the account regardless of IP.
  */
-export function bumpLoginFailure(email: string): Promise<number> {
-  return bump('login:fail', email.toLowerCase(), LOGIN_WINDOW_SEC);
-}
-
-export function resetLoginFailures(email: string): Promise<void> {
-  return reset('login:fail', email.toLowerCase());
+export async function unlockAccount(email: string): Promise<number> {
+  const pattern = `login:hardfail:${email.toLowerCase()}:*`;
+  let cursor = '0';
+  let removed = 0;
+  do {
+    const [next, keys] = await redis().scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+    cursor = next;
+    if (keys.length > 0) removed += await redis().del(...keys);
+  } while (cursor !== '0');
+  removed += await redis().del(softKey(email));
+  return removed;
 }
 
 /**
@@ -98,16 +139,4 @@ export async function releaseSseSlot(adminUserId: bigint): Promise<void> {
   // Never let the counter go negative — clean up if we hit 0.
   const remaining = await redis().decr(k).catch(() => 0);
   if (remaining <= 0) await redis().del(k).catch(() => undefined);
-}
-
-// ---------- Compat aliases (kept for legacy call sites) --------------------
-// The old (email, ip) tuple key is retained as a thin wrapper so any missed
-// call site keeps working during the rollout.
-
-export const LOGIN_LOCKOUT_THRESHOLD = LOGIN_HARD_LOCK;
-export function bumpLoginAttempt(key: string, windowSec = LOGIN_WINDOW_SEC): Promise<number> {
-  return bump('login:fail', key, windowSec);
-}
-export function resetLoginAttempts(key: string): Promise<void> {
-  return reset('login:fail', key);
 }

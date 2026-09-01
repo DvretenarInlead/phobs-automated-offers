@@ -16,22 +16,32 @@ import { rateFiltersSchema } from '../tenancy/rateFilters.js';
 import { overridesSchema, resolveOverrides } from '../tenancy/overrides.js';
 import { seal } from '../crypto/tokenVault.js';
 import { enqueueProcessDeal } from '../queue/index.js';
-import { fetchAvailability, fetchPriceQuote } from '../phobs/client.js';
+import { assertAllowedEndpoint, fetchAvailability, fetchPriceQuote } from '../phobs/client.js';
 import { loadTenantContext } from '../tenancy/config.js';
 import { buildWorkflowActionDefinition } from '../hubspot/workflowActionDefinition.js';
 
 const hubIdParamSchema = z.object({ hubId: z.string().regex(/^\d+$/) });
 
+// Value the GET handler returns in place of secrets. A PUT carrying it back
+// means "unchanged" and is ignored (never stored) — protects against a UI
+// round-tripping the mask into the vault.
+const MASK = '••••••••';
+const notMask = (s: z.ZodString) =>
+  s.refine((v) => v !== MASK, { message: 'masked placeholder is not a valid value' });
+
 const updateConfigSchema = z.object({
-  phobs_endpoint: z.string().url().optional(),
-  phobs_site_id: z.string().min(1).optional(),
-  phobs_auth_user: z.string().min(1).optional(),
-  phobs_auth_pass: z.string().min(1).optional(),
-  hubdb_table_id: z.string().min(1).optional(),
-  hubdb_column_map: z.record(z.string(), z.string()).optional(),
-  quote_template_id: z.string().min(1).optional(),
-  owner_id: z.union([z.string(), z.number()]).optional(),
-  access_code: z.string().nullable().optional(),
+  phobs_endpoint: z.string().url().max(512).optional(),
+  phobs_site_id: z.string().min(1).max(128).optional(),
+  phobs_auth_user: notMask(z.string().min(1).max(256)).optional(),
+  phobs_auth_pass: notMask(z.string().min(1).max(256)).optional(),
+  hubdb_table_id: z.string().min(1).max(64).optional(),
+  hubdb_column_map: z.record(z.string().max(64), z.string().max(128)).optional(),
+  quote_template_id: z.string().min(1).max(64).optional(),
+  owner_id: z
+    .union([z.string().regex(/^\d{1,20}$/, 'owner_id must be numeric'), z.number().int().nonnegative()])
+    .optional(),
+  // null clears; the mask string is treated as "unchanged" (see handler).
+  access_code: z.string().max(128).nullable().optional(),
   property_rules: propertyRulesSchema.optional(),
   rate_filters: rateFiltersSchema.optional(),
   trigger_mode: z.enum(['webhook', 'workflow_extension']).optional(),
@@ -102,15 +112,15 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
         hubId: hubIdStr,
         phobs_endpoint: cfg.phobsEndpoint,
         phobs_site_id: cfg.phobsSiteId,
-        phobs_auth_user: '••••••••',
-        phobs_auth_pass: '••••••••',
+        phobs_auth_user: MASK,
+        phobs_auth_pass: MASK,
         hubdb_table_id: cfg.hubdbTableId,
         hubdb_column_map: cfg.hubdbColumnMap,
         quote_template_id: cfg.quoteTemplateId,
         owner_id: cfg.ownerId.toString(),
         // Loyalty access code is a shared secret with Phobs; mask like Phobs
         // creds. UI shows whether it's set via `access_code_set`.
-        access_code: cfg.accessCode ? '••••••••' : null,
+        access_code: cfg.accessCode ? MASK : null,
         access_code_set: Boolean(cfg.accessCode),
         property_rules: cfg.propertyRules,
         rate_filters: cfg.rateFilters,
@@ -140,7 +150,18 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
         .limit(1);
 
       const updates: Partial<typeof tenantConfig.$inferInsert> = { updatedAt: new Date() };
-      if (body.phobs_endpoint !== undefined) updates.phobsEndpoint = body.phobs_endpoint;
+      if (body.phobs_endpoint !== undefined) {
+        // Same SSRF allow-list the client enforces at call time — fail the
+        // save with a clear error instead of every job later.
+        try {
+          assertAllowedEndpoint(body.phobs_endpoint);
+        } catch {
+          return reply
+            .code(400)
+            .send({ error: 'invalid_phobs_endpoint', message: 'must be an https://*.phobs.net URL' });
+        }
+        updates.phobsEndpoint = body.phobs_endpoint;
+      }
       if (body.phobs_site_id !== undefined) updates.phobsSiteId = body.phobs_site_id;
       if (body.phobs_auth_user !== undefined) {
         const s = seal(body.phobs_auth_user, `phobs_user:${hubId}`);
@@ -158,7 +179,9 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
       if (body.hubdb_column_map !== undefined) updates.hubdbColumnMap = body.hubdb_column_map;
       if (body.quote_template_id !== undefined) updates.quoteTemplateId = body.quote_template_id;
       if (body.owner_id !== undefined) updates.ownerId = BigInt(body.owner_id);
-      if (body.access_code !== undefined) updates.accessCode = body.access_code;
+      if (body.access_code !== undefined && body.access_code !== MASK) {
+        updates.accessCode = body.access_code === '' ? null : body.access_code;
+      }
       if (body.property_rules !== undefined) updates.propertyRules = body.property_rules;
       if (body.rate_filters !== undefined) updates.rateFilters = body.rate_filters;
       if (body.trigger_mode !== undefined) updates.triggerMode = body.trigger_mode;
@@ -364,7 +387,8 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
 }
 
 function redactConfig(cfg: typeof tenantConfig.$inferSelect): Record<string, unknown> {
-  // Drop ciphertext blobs; keep everything else.
+  // Drop ciphertext blobs and the loyalty access code (a shared secret with
+  // Phobs); keep everything else. History/audit only record whether it's set.
   const {
     phobsAuthUserCt: _u1,
     phobsAuthUserIv: _u2,
@@ -372,9 +396,11 @@ function redactConfig(cfg: typeof tenantConfig.$inferSelect): Record<string, unk
     phobsAuthPassCt: _p1,
     phobsAuthPassIv: _p2,
     phobsAuthPassTag: _p3,
+    accessCode,
     ...safe
   } = cfg;
   return {
+    accessCodeSet: Boolean(accessCode),
     ...safe,
     hubId: safe.hubId.toString(),
     ownerId: safe.ownerId.toString(),

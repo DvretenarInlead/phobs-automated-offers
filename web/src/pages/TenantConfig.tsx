@@ -2,10 +2,12 @@ import { useEffect, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, ApiError } from '../lib/api';
+import { api, describeError } from '../lib/api';
 import { RateFiltersEditor } from '../components/RateFiltersEditor';
 import type { RateFilters } from '../components/RateFiltersEditor';
 import { CidrListEditor } from '../components/CidrListEditor';
+import { OverridesEditor } from '../components/OverridesEditor';
+import type { Overrides } from '../components/OverridesEditor';
 
 interface ConfigResponse {
   hubId: string;
@@ -17,10 +19,12 @@ interface ConfigResponse {
   hubdb_column_map: Record<string, string>;
   quote_template_id: string;
   owner_id: string;
-  access_code: string | null;
+  access_code: string | null; // masked when set
+  access_code_set: boolean;
   property_rules: Record<string, { name: string; donja: number; gornja: number }>;
   rate_filters: Record<string, unknown>;
   trigger_mode: 'webhook' | 'workflow_extension';
+  overrides: Overrides;
 }
 
 interface PropertyRow {
@@ -31,6 +35,36 @@ interface PropertyRow {
   gornja: string;
 }
 
+interface FormState {
+  phobs_endpoint: string;
+  phobs_site_id: string;
+  hubdb_table_id: string;
+  hubdb_column_map: Record<string, string>;
+  quote_template_id: string;
+  owner_id: string;
+  trigger_mode: 'webhook' | 'workflow_extension';
+  phobs_auth_user_new: string;
+  phobs_auth_pass_new: string;
+  /** New loyalty access code; blank = keep current. */
+  access_code_new: string;
+  /** Explicitly remove the stored access code. */
+  clear_access_code: boolean;
+}
+
+const EMPTY_FORM: FormState = {
+  phobs_endpoint: '',
+  phobs_site_id: '',
+  hubdb_table_id: '',
+  hubdb_column_map: {},
+  quote_template_id: '',
+  owner_id: '',
+  trigger_mode: 'webhook',
+  phobs_auth_user_new: '',
+  phobs_auth_pass_new: '',
+  access_code_new: '',
+  clear_access_code: false,
+};
+
 export function TenantConfig(): ReactElement {
   const { hubId } = useParams<{ hubId: string }>();
   const qc = useQueryClient();
@@ -38,28 +72,32 @@ export function TenantConfig(): ReactElement {
     queryKey: ['config', hubId],
     queryFn: () => api<ConfigResponse>(`/tenants/${hubId!}/config`),
     enabled: Boolean(hubId),
+    // Never let a background refetch overwrite in-progress edits.
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   });
 
-  const [form, setForm] = useState<Partial<ConfigResponse> & {
-    phobs_auth_user_new?: string;
-    phobs_auth_pass_new?: string;
-  }>({});
+  const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [rules, setRules] = useState<PropertyRow[]>([]);
   const [rateFilters, setRateFilters] = useState<RateFilters>({});
+  const [overrides, setOverrides] = useState<Overrides | null>(null);
+  const [hydrated, setHydrated] = useState(false);
+  const [dirty, setDirty] = useState(false);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Hydrate from server response once.
+  // Hydrate from the server response exactly once per page load (and again
+  // after our own successful save, which resets `hydrated`).
   useEffect(() => {
-    if (!q.data) return;
+    if (!q.data || hydrated) return;
     setForm({
+      ...EMPTY_FORM,
       phobs_endpoint: q.data.phobs_endpoint,
       phobs_site_id: q.data.phobs_site_id,
       hubdb_table_id: q.data.hubdb_table_id,
-      hubdb_column_map: q.data.hubdb_column_map,
+      hubdb_column_map: q.data.hubdb_column_map ?? {},
       quote_template_id: q.data.quote_template_id,
       owner_id: q.data.owner_id,
-      access_code: q.data.access_code,
       trigger_mode: q.data.trigger_mode,
     });
     setRules(
@@ -72,66 +110,132 @@ export function TenantConfig(): ReactElement {
       })),
     );
     setRateFilters((q.data.rate_filters as RateFilters) ?? {});
-  }, [q.data]);
+    setOverrides(q.data.overrides);
+    setHydrated(true);
+    setDirty(false);
+  }, [q.data, hydrated]);
+
+  // Warn before losing unsaved edits.
+  useEffect(() => {
+    if (!dirty) return;
+    const handler = (e: BeforeUnloadEvent): void => {
+      e.preventDefault();
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [dirty]);
+
+  const touch = <T,>(setter: (v: T) => void) => (v: T): void => {
+    setter(v);
+    setDirty(true);
+  };
+  const setField = <K extends keyof FormState>(k: K, v: FormState[K]): void => {
+    setForm((f) => ({ ...f, [k]: v }));
+    setDirty(true);
+  };
+
+  const validateLocally = (): string | null => {
+    if (!/^https:\/\/([a-z0-9-]+\.)*phobs\.net(\/|$)/i.test(form.phobs_endpoint.trim())) {
+      return 'Phobs endpoint must be an https://…phobs.net URL.';
+    }
+    if (!form.phobs_site_id.trim()) return 'Site ID is required.';
+    if (!form.hubdb_table_id.trim()) return 'HubDB table ID is required.';
+    if (!form.quote_template_id.trim()) return 'Quote template ID is required.';
+    if (!/^\d{1,20}$/.test(form.owner_id.trim())) return 'Owner ID must be numeric.';
+    for (const r of rules) {
+      if (!r.propertyId.trim()) continue;
+      const d = Number(r.donja);
+      const g = Number(r.gornja);
+      if (!Number.isFinite(d) || d < 0) return `Property ${r.propertyId}: "donja" must be a number ≥ 0.`;
+      if (!Number.isFinite(g) || g <= 0) return `Property ${r.propertyId}: "gornja" must be a number > 0.`;
+      if (g <= d) return `Property ${r.propertyId}: "gornja" must be greater than "donja".`;
+    }
+    return null;
+  };
 
   const save = useMutation({
     mutationFn: async (): Promise<{ ok: true }> => {
+      const localError = validateLocally();
+      if (localError) throw new Error(localError);
+
       const property_rules = Object.fromEntries(
         rules
           .filter((r) => r.propertyId.trim())
           .map((r) => [
             r.propertyId.trim(),
-            { name: r.name.trim(), donja: Number(r.donja), gornja: Number(r.gornja) },
+            {
+              name: r.name.trim() || r.propertyId.trim(),
+              donja: Number(r.donja),
+              gornja: Number(r.gornja),
+            },
           ]),
       );
 
       const body: Record<string, unknown> = {
-        phobs_endpoint: form.phobs_endpoint,
-        phobs_site_id: form.phobs_site_id,
-        hubdb_table_id: form.hubdb_table_id,
+        phobs_endpoint: form.phobs_endpoint.trim(),
+        phobs_site_id: form.phobs_site_id.trim(),
+        hubdb_table_id: form.hubdb_table_id.trim(),
         hubdb_column_map: form.hubdb_column_map,
-        quote_template_id: form.quote_template_id,
-        owner_id: form.owner_id,
-        access_code: form.access_code ?? null,
+        quote_template_id: form.quote_template_id.trim(),
+        owner_id: form.owner_id.trim(),
         trigger_mode: form.trigger_mode,
         property_rules,
         rate_filters: rateFilters,
       };
+      if (overrides) {
+        body.overrides = {
+          ...overrides,
+          // Rows the user added but never filled in would fail server
+          // validation (property min length 1) — drop them silently.
+          skip_conditions: overrides.skip_conditions.filter((c) => c.property.trim()),
+          price_quote: {
+            ...overrides.price_quote,
+            endpoint: overrides.price_quote.endpoint?.trim() || null,
+          },
+        };
+      }
+      // Secrets: only sent when the operator typed a new value / asked to clear.
       if (form.phobs_auth_user_new) body.phobs_auth_user = form.phobs_auth_user_new;
       if (form.phobs_auth_pass_new) body.phobs_auth_pass = form.phobs_auth_pass_new;
+      if (form.clear_access_code) body.access_code = null;
+      else if (form.access_code_new.trim()) body.access_code = form.access_code_new.trim();
+
       return api(`/tenants/${hubId!}/config`, { method: 'PUT', body });
     },
     onSuccess: async () => {
       setSavedAt(new Date());
       setError(null);
-      setForm((f) => ({ ...f, phobs_auth_user_new: '', phobs_auth_pass_new: '' }));
+      setDirty(false);
+      setHydrated(false); // re-hydrate from the fresh server state
       await qc.invalidateQueries({ queryKey: ['config', hubId] });
     },
     onError: (err) => {
-      setError(err instanceof ApiError ? err.message : 'save_failed');
+      setError(err instanceof Error && !('status' in err) ? err.message : describeError(err, 'save_failed'));
     },
   });
 
   if (q.isPending) return <div className="text-slate-500 text-sm">Loading…</div>;
-  if (q.error) return <div className="text-rose-400 text-sm">Failed to load config.</div>;
+  if (q.error) return <div className="text-rose-400 text-sm">{describeError(q.error, 'Failed to load config.')}</div>;
 
-  const setField = <K extends keyof ConfigResponse>(k: K, v: ConfigResponse[K]): void => {
-    setForm((f) => ({ ...f, [k]: v }));
-  };
+  const accessCodeSet = q.data.access_code_set;
 
   return (
     <div className="space-y-6">
-      <header className="flex items-center justify-between">
+      <header className="flex items-center justify-between sticky top-0 z-10 bg-slate-950/90 backdrop-blur py-3 -my-3">
         <div>
           <h1 className="text-2xl font-semibold">Tenant config</h1>
           <div className="text-slate-500 text-sm font-mono">hub_id={hubId}</div>
         </div>
         <div className="flex items-center gap-3">
-          {savedAt && <span className="text-emerald-400 text-sm">Saved {savedAt.toLocaleTimeString()}</span>}
-          {error && <span className="text-rose-400 text-sm">{error}</span>}
+          {dirty && !save.isPending && <span className="text-amber-300 text-sm">Unsaved changes</span>}
+          {savedAt && !dirty && (
+            <span className="text-emerald-400 text-sm">Saved {savedAt.toLocaleTimeString()}</span>
+          )}
+          {error && <span className="text-rose-400 text-sm max-w-md truncate" title={error}>{error}</span>}
           <button
+            type="button"
             onClick={() => save.mutate()}
-            disabled={save.isPending}
+            disabled={save.isPending || !hydrated}
             className="btn-primary"
           >
             {save.isPending ? 'Saving…' : 'Save changes'}
@@ -142,28 +246,31 @@ export function TenantConfig(): ReactElement {
       <section className="card">
         <h2 className="font-semibold mb-4">Phobs connection</h2>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <Field label="Endpoint URL">
+          <Field label="Endpoint URL (https://…phobs.net)">
             <input
-              className="input"
-              value={form.phobs_endpoint ?? ''}
+              className="input font-mono"
+              value={form.phobs_endpoint}
               onChange={(e) => setField('phobs_endpoint', e.target.value)}
               placeholder="https://api.phobs.net/..."
+              maxLength={512}
             />
           </Field>
           <Field label="Site ID">
             <input
               className="input"
-              value={form.phobs_site_id ?? ''}
+              value={form.phobs_site_id}
               onChange={(e) => setField('phobs_site_id', e.target.value)}
+              maxLength={128}
             />
           </Field>
           <Field label="Username (leave blank to keep)">
             <input
               className="input"
               autoComplete="off"
-              value={form.phobs_auth_user_new ?? ''}
-              onChange={(e) => setForm((f) => ({ ...f, phobs_auth_user_new: e.target.value }))}
+              value={form.phobs_auth_user_new}
+              onChange={(e) => setField('phobs_auth_user_new', e.target.value)}
               placeholder="••••••••"
+              maxLength={256}
             />
           </Field>
           <Field label="Password (leave blank to keep)">
@@ -171,9 +278,10 @@ export function TenantConfig(): ReactElement {
               type="password"
               className="input"
               autoComplete="new-password"
-              value={form.phobs_auth_pass_new ?? ''}
-              onChange={(e) => setForm((f) => ({ ...f, phobs_auth_pass_new: e.target.value }))}
+              value={form.phobs_auth_pass_new}
+              onChange={(e) => setField('phobs_auth_pass_new', e.target.value)}
               placeholder="••••••••"
+              maxLength={256}
             />
           </Field>
         </div>
@@ -184,69 +292,92 @@ export function TenantConfig(): ReactElement {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <Field label="HubDB table ID">
             <input
-              className="input"
-              value={form.hubdb_table_id ?? ''}
+              className="input font-mono"
+              value={form.hubdb_table_id}
               onChange={(e) => setField('hubdb_table_id', e.target.value)}
+              maxLength={64}
             />
           </Field>
           <Field label="Quote template ID">
             <input
-              className="input"
-              value={form.quote_template_id ?? ''}
+              className="input font-mono"
+              value={form.quote_template_id}
               onChange={(e) => setField('quote_template_id', e.target.value)}
+              maxLength={64}
             />
           </Field>
-          <Field label="Owner ID">
+          <Field label="Owner ID (numeric)">
             <input
-              className="input"
-              value={form.owner_id ?? ''}
-              onChange={(e) => setField('owner_id', e.target.value)}
-            />
-          </Field>
-          <Field label="Access code (loyalty)">
-            <input
-              className="input"
-              value={form.access_code ?? ''}
-              onChange={(e) => setField('access_code', e.target.value || null)}
-              placeholder="(optional)"
+              className="input font-mono"
+              inputMode="numeric"
+              pattern="\d+"
+              value={form.owner_id}
+              onChange={(e) => setField('owner_id', e.target.value.replace(/\D/g, ''))}
+              maxLength={20}
             />
           </Field>
           <Field label="Trigger mode">
             <select
               className="input"
-              value={form.trigger_mode ?? 'webhook'}
+              value={form.trigger_mode}
               onChange={(e) => setField('trigger_mode', e.target.value as 'webhook' | 'workflow_extension')}
             >
               <option value="webhook">"Send a webhook" workflow action</option>
               <option value="workflow_extension">Workflow extension (custom action)</option>
             </select>
           </Field>
+          <Field
+            label={
+              accessCodeSet
+                ? 'Loyalty access code — currently set (leave blank to keep)'
+                : 'Loyalty access code — not set (optional)'
+            }
+          >
+            <input
+              className="input font-mono"
+              autoComplete="off"
+              value={form.access_code_new}
+              disabled={form.clear_access_code}
+              onChange={(e) => setField('access_code_new', e.target.value)}
+              placeholder={accessCodeSet ? '••••••••' : 'e.g. GQ2079H1G069'}
+              maxLength={128}
+            />
+          </Field>
+          {accessCodeSet && (
+            <label className="flex items-center gap-2 text-sm text-slate-300 self-end pb-2">
+              <input
+                type="checkbox"
+                checked={form.clear_access_code}
+                onChange={(e) => setField('clear_access_code', e.target.checked)}
+              />
+              Remove the stored access code on save
+            </label>
+          )}
         </div>
 
         <h3 className="font-medium mt-6 mb-2 text-sm text-slate-300">HubDB column mapping</h3>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <Field label="Unit ID column name">
             <input
-              className="input"
-              value={form.hubdb_column_map?.unit_id_column ?? ''}
+              className="input font-mono"
+              value={form.hubdb_column_map.unit_id_column ?? ''}
               onChange={(e) =>
-                setField('hubdb_column_map', {
-                  ...(form.hubdb_column_map ?? {}),
-                  unit_id_column: e.target.value,
-                })
+                setField('hubdb_column_map', { ...form.hubdb_column_map, unit_id_column: e.target.value })
               }
+              maxLength={128}
             />
           </Field>
           <Field label="Property ID column name">
             <input
-              className="input"
-              value={form.hubdb_column_map?.property_id_column ?? ''}
+              className="input font-mono"
+              value={form.hubdb_column_map.property_id_column ?? ''}
               onChange={(e) =>
                 setField('hubdb_column_map', {
-                  ...(form.hubdb_column_map ?? {}),
+                  ...form.hubdb_column_map,
                   property_id_column: e.target.value,
                 })
               }
+              maxLength={128}
             />
           </Field>
         </div>
@@ -259,8 +390,8 @@ export function TenantConfig(): ReactElement {
             type="button"
             className="btn-secondary text-xs"
             onClick={() =>
-              setRules((rs) => [
-                ...rs,
+              touch(setRules)([
+                ...rules,
                 {
                   id: `r${String(Date.now())}`,
                   propertyId: '',
@@ -297,38 +428,41 @@ export function TenantConfig(): ReactElement {
                     <input
                       className="input font-mono"
                       value={r.propertyId}
-                      onChange={(e) => updateRule(setRules, i, { propertyId: e.target.value })}
+                      onChange={(e) => updateRule(touch(setRules), rules, i, { propertyId: e.target.value })}
                     />
                   </td>
                   <td>
                     <input
                       className="input"
                       value={r.name}
-                      onChange={(e) => updateRule(setRules, i, { name: e.target.value })}
+                      placeholder={r.propertyId || 'name'}
+                      onChange={(e) => updateRule(touch(setRules), rules, i, { name: e.target.value })}
                     />
                   </td>
                   <td>
                     <input
                       type="number"
                       step="0.01"
+                      min={0}
                       className="input"
                       value={r.donja}
-                      onChange={(e) => updateRule(setRules, i, { donja: e.target.value })}
+                      onChange={(e) => updateRule(touch(setRules), rules, i, { donja: e.target.value })}
                     />
                   </td>
                   <td>
                     <input
                       type="number"
                       step="0.01"
+                      min={0.01}
                       className="input"
                       value={r.gornja}
-                      onChange={(e) => updateRule(setRules, i, { gornja: e.target.value })}
+                      onChange={(e) => updateRule(touch(setRules), rules, i, { gornja: e.target.value })}
                     />
                   </td>
                   <td>
                     <button
                       type="button"
-                      onClick={() => setRules((rs) => rs.filter((_, j) => j !== i))}
+                      onClick={() => touch(setRules)(rules.filter((_, j) => j !== i))}
                       className="text-rose-400 hover:text-rose-300 text-sm"
                     >
                       Remove
@@ -343,7 +477,21 @@ export function TenantConfig(): ReactElement {
 
       <section className="card">
         <h2 className="font-semibold mb-4">Rate filters</h2>
-        <RateFiltersEditor value={rateFilters} onChange={setRateFilters} />
+        <RateFiltersEditor value={rateFilters} onChange={touch(setRateFilters)} />
+      </section>
+
+      <section className="card">
+        <h2 className="font-semibold mb-1">Pipeline overrides</h2>
+        <p className="text-slate-500 text-xs mb-4">
+          Field mappings, quote defaults, skip conditions, loyalty trigger, SKU template and the
+          firm price-quote step — all editable without a deploy. Saved together with the rest of
+          this page.
+        </p>
+        {overrides ? (
+          <OverridesEditor value={overrides} onChange={touch(setOverrides)} />
+        ) : (
+          <div className="text-slate-500 text-sm">Loading…</div>
+        )}
       </section>
 
       <WebhookAllowlistSection hubId={hubId!} />
@@ -375,6 +523,8 @@ function WebhookAllowlistSection({ hubId }: { hubId: string }): ReactElement {
   const q = useQuery({
     queryKey: ['webhook-allowlist', hubId],
     queryFn: () => api<WebhookAllowlistResponse>(`/tenants/${hubId}/webhook-allowlist`),
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   });
   const [cidrs, setCidrs] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -399,18 +549,7 @@ function WebhookAllowlistSection({ hubId }: { hubId: string }): ReactElement {
       setSavedAt(new Date());
       await qc.invalidateQueries({ queryKey: ['webhook-allowlist', hubId] });
     },
-    onError: (err) => {
-      if (err instanceof ApiError) {
-        const detail = err.detail as { invalid?: string[] } | null;
-        if (err.message === 'invalid_cidrs' && detail?.invalid?.length) {
-          setError(`Invalid entries: ${detail.invalid.join(', ')}`);
-          return;
-        }
-        setError(err.message);
-        return;
-      }
-      setError('save_failed');
-    },
+    onError: (err) => setError(describeError(err, 'save_failed')),
   });
 
   return (
@@ -445,7 +584,7 @@ function WebhookAllowlistSection({ hubId }: { hubId: string }): ReactElement {
       {q.isPending ? (
         <div className="text-slate-500 text-sm">Loading…</div>
       ) : q.error ? (
-        <div className="text-rose-400 text-sm">Failed to load allow-list.</div>
+        <div className="text-rose-400 text-sm">{describeError(q.error, 'Failed to load allow-list.')}</div>
       ) : (
         <CidrListEditor
           value={cidrs}
@@ -457,7 +596,7 @@ function WebhookAllowlistSection({ hubId }: { hubId: string }): ReactElement {
   );
 }
 
-function Field({ label, children }: { label: string; children: ReactNode }): ReactElement {
+function Field({ label, children }: { label: ReactNode; children: ReactNode }): ReactElement {
   return (
     <div>
       <label className="label">{label}</label>
@@ -467,9 +606,10 @@ function Field({ label, children }: { label: string; children: ReactNode }): Rea
 }
 
 function updateRule(
-  setRules: (fn: (rs: PropertyRow[]) => PropertyRow[]) => void,
+  set: (rs: PropertyRow[]) => void,
+  rules: PropertyRow[],
   i: number,
   patch: Partial<PropertyRow>,
 ): void {
-  setRules((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  set(rules.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 }

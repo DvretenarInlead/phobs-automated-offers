@@ -24,7 +24,20 @@ export function generateTotp(email: string): NewTotp {
   return { base32Secret: secret.base32, uri: totp.toString() };
 }
 
-export function verifyTotp(base32Secret: string, code: string): boolean {
+/**
+ * Verifies a code and returns the time-step it matched, or null.
+ *
+ * Replay protection: callers persist the returned step as the account's
+ * `totpLastStep` and pass it back as `lastUsedStep`; a code for a step at or
+ * before that is rejected even inside the ±1 window. Each code is therefore
+ * accepted at most once (RFC 6238 §5.2).
+ */
+export function verifyTotpOnce(
+  base32Secret: string,
+  code: string,
+  lastUsedStep: number | null,
+  now = Date.now(),
+): number | null {
   const totp = new TOTP({
     issuer: ISSUER,
     algorithm: 'SHA1',
@@ -32,14 +45,22 @@ export function verifyTotp(base32Secret: string, code: string): boolean {
     period: STEP_SECONDS,
     secret: Secret.fromBase32(base32Secret),
   });
-  const delta = totp.validate({ token: code, window: WINDOW });
-  return delta !== null;
+  const delta = totp.validate({ token: code, window: WINDOW, timestamp: now });
+  if (delta === null) return null;
+  const step = Math.floor(now / 1000 / STEP_SECONDS) + delta;
+  if (lastUsedStep !== null && step <= lastUsedStep) return null;
+  return step;
+}
+
+/** Stateless check (enrolment confirm, tests). Prefer verifyTotpOnce for logins. */
+export function verifyTotp(base32Secret: string, code: string): boolean {
+  return verifyTotpOnce(base32Secret, code, null) !== null;
 }
 
 /**
- * Recovery codes are 10 codes of 10 characters each. We store SHA-256 hashes
- * (no salt — high entropy means no rainbow-table risk and we need O(1) check
- * across the list).
+ * Recovery codes are 10 codes of 16 hex characters each. We store SHA-256
+ * hashes (no salt — 64-bit random entropy means no rainbow-table risk and
+ * we need O(1) check across the list).
  */
 export function generateRecoveryCodes(count = 10): {
   plain: string[];

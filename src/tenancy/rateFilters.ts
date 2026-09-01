@@ -64,7 +64,11 @@ export function applyRateFilters(rates: PhobsRate[], filtersRaw: unknown): Filte
         continue;
       }
 
-      const unitFilter = filters.units[unit.unitId];
+      // Own-property lookup: a Phobs UnitId like "constructor" must not
+      // resolve to Object.prototype members.
+      const unitFilter = Object.hasOwn(filters.units, unit.unitId)
+        ? filters.units[unit.unitId]
+        : undefined;
 
       if (filters.global.exclude_rate_ids.includes(rate.rateId)) {
         drop('global.exclude_rate_ids', rate.rateId);
@@ -108,7 +112,9 @@ export function applyRateFilters(rates: PhobsRate[], filtersRaw: unknown): Filte
   const truncated: FilteredRate[] = [];
   const seenPerUnit = new Map<string, number>();
   for (const item of selected) {
-    const unitFilter = filters.units[item.unit.unitId];
+    const unitFilter = Object.hasOwn(filters.units, item.unit.unitId)
+      ? filters.units[item.unit.unitId]
+      : undefined;
     const cap = unitFilter?.max_results;
     const count = seenPerUnit.get(item.unit.unitId) ?? 0;
     if (cap != null && count >= cap) {

@@ -355,7 +355,9 @@ function NullableNumberField({
         <input
           type="checkbox"
           checked={value !== null}
-          onChange={(e) => onChange(e.target.checked ? (min ?? 0) : null)}
+          // Seed with a value the server accepts (limits must be positive), so
+          // ticking the box never produces an unsaveable form by itself.
+          onChange={(e) => onChange(e.target.checked ? Math.max(1, min ?? 1) : null)}
           title="enable limit"
         />
         <input

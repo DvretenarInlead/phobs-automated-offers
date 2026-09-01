@@ -1,7 +1,12 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { verifyApiToken } from '../lib/apiTokens.js';
-import { claimIdempotencyKey, idempotencyKeyFor } from '../lib/idempotency.js';
+import {
+  claimIdempotencyKey,
+  idempotencyKeyFor,
+  jobIdFor,
+  releaseIdempotencyKey,
+} from '../lib/idempotency.js';
 import { enqueueProcessDeal } from '../queue/index.js';
 import { liveEmit } from '../lib/liveEmit.js';
 import { writeAudit } from '../lib/audit.js';
@@ -19,23 +24,34 @@ import { compileAllowlist, normaliseClientIp } from '../lib/ipAllowlist.js';
  *   { "payload": { "hs_object_id": 12345, ... } }
  *
  * Auth: per-tenant API tokens (see src/lib/apiTokens.ts). Token maps to
- * exactly one hub_id; no cross-tenant capability. Optional per-token IP
- * allow-list (CIDR list) enforced right after auth.
+ * exactly one hub_id; no cross-tenant capability.
+ *
+ * Idempotency: if `Idempotency-Key` header is set, the same key + hub_id
+ * dedupes across retries within 7 days. Otherwise a fresh key is derived
+ * from (hub_id, deal_id, payload hash) so accidental double-fires from the
+ * same JSON body still dedupe.
+ *
+ * Response: 200 { ok, jobId, duplicate: false }
+ *           200 { ok, duplicate: true }  (same idempotency key seen already)
+ *           401 { error: 'unauthorized' }
+ *           400 { error: 'invalid_payload' }
+ *           429 { ... }  (rate limit)
  */
 
 const bodySchema = z.object({
   payload: z.record(z.string(), z.unknown()).or(z.array(z.record(z.string(), z.unknown())).min(1)),
 });
 
-// Per-token rate limit — a compromised token can't flood us into OOM.
-// 300/min is well above any legitimate integration.
+// Per-IP + per-token-prefix rate limit. Keying by the prefix alone would let
+// one client mint unlimited fresh buckets by rotating fake prefixes; the IP
+// component bounds that to what a single source can do.
 const TRIGGER_RL = {
   max: 300,
   timeWindow: '1 minute',
   keyGenerator: (req: FastifyRequest): string => {
     const auth = req.headers.authorization ?? '';
-    if (auth.startsWith('Bearer phk_')) return `trigger:${auth.slice(7, 19)}`;
-    return `trigger:ip:${req.ip}`;
+    const prefix = auth.startsWith('Bearer phk_') ? auth.slice(7, 19) : 'anon';
+    return `trigger:${req.ip}:${prefix}`;
   },
 };
 
@@ -95,6 +111,8 @@ export function registerApiTriggerRoutes(app: FastifyInstance): void {
       if (dealIdRaw === undefined || dealIdRaw === null) {
         return reply.code(400).send({ error: 'missing_hs_object_id' });
       }
+      // Accept only scalar values for hs_object_id (webhook payloads sometimes
+      // stuff objects here from misconfigured HubSpot workflows).
       if (
         typeof dealIdRaw !== 'string' &&
         typeof dealIdRaw !== 'number' &&
@@ -109,6 +127,7 @@ export function registerApiTriggerRoutes(app: FastifyInstance): void {
         return reply.code(400).send({ error: 'bad_hs_object_id' });
       }
 
+      // Idempotency: prefer client-supplied key; otherwise derive from body.
       const idemHeader = req.headers['idempotency-key'];
       const rawKeyBytes = Buffer.from(JSON.stringify(body.payload));
       const idemKey =
@@ -116,21 +135,32 @@ export function registerApiTriggerRoutes(app: FastifyInstance): void {
           ? `client:${token.hubId.toString()}:${idemHeader}`
           : idempotencyKeyFor(token.hubId, dealId, rawKeyBytes);
 
-      const provisionalJobId = `api-${token.hubId.toString()}-${dealId.toString()}-${idemKey.slice(0, 12)}`;
-      const fresh = await claimIdempotencyKey(idemKey, provisionalJobId, token.hubId);
+      // Job id is a hash of the key: BullMQ forbids ':' in custom ids and the
+      // hash keeps distinct client keys distinct (a truncated raw key would
+      // collide every client-keyed job of a hub onto one id).
+      const jobIdWanted = jobIdFor('api', token.hubId, dealId, idemKey);
+      const fresh = await claimIdempotencyKey(idemKey, jobIdWanted, token.hubId);
       if (!fresh) {
         return reply.code(200).send({ ok: true, duplicate: true });
       }
 
-      const jobId = await enqueueProcessDeal(
-        {
-          hubId: token.hubId.toString(),
-          source: 'manual',
-          requestId: req.requestId,
-          rawPayload: body.payload,
-        },
-        { jobId: provisionalJobId },
-      );
+      let jobId: string;
+      try {
+        jobId = await enqueueProcessDeal(
+          {
+            hubId: token.hubId.toString(),
+            source: 'manual',
+            requestId: req.requestId,
+            rawPayload: body.payload,
+          },
+          { jobId: jobIdWanted },
+        );
+      } catch (err) {
+        // Don't leave a claimed key behind with no job — the caller's retry
+        // must be processed, not reported as a duplicate.
+        await releaseIdempotencyKey(idemKey).catch(() => undefined);
+        throw err;
+      }
 
       liveEmit('webhooks', token.hubId, {
         ts: Date.now(),

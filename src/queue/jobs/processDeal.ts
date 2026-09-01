@@ -53,9 +53,42 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
   const item = Array.isArray(parsed) ? parsed[0]! : parsed;
 
   // ---- Step 1: load tenant context (contains resolved overrides) ------------
-  const tenant = await runStep(jobId, hubId, 0n, 1, 'load_tenant', async () => {
-    return loadTenantContext(hubId);
-  });
+  // The context carries decrypted Phobs credentials and the loyalty access
+  // code — only a redacted summary is ever persisted to job_steps.
+  const tenant = await runStep(
+    jobId,
+    hubId,
+    0n,
+    1,
+    'load_tenant',
+    () => loadTenantContext(hubId),
+    (t) => ({
+      hubId: t.hubId.toString(),
+      status: t.status,
+      triggerMode: t.triggerMode,
+      hubdbTableId: t.hubdbTableId,
+      quoteTemplateId: t.quoteTemplateId,
+      phobsEndpoint: t.phobs.endpoint,
+      priceQuoteEnabled: t.overrides.price_quote.enabled,
+    }),
+  );
+
+  // Resume bookkeeping: HubSpot objects created by an earlier attempt of this
+  // same job are reused instead of re-created, so a retry after a mid-run
+  // failure never leaves duplicate products / line items / quotes behind.
+  const progress = job.data.progress ?? {};
+  const createdProducts: Record<string, string> = { ...(progress.products ?? {}) };
+  const createdLineItems: Record<string, string> = { ...(progress.lineItems ?? {}) };
+  const saveProgress = async (): Promise<void> => {
+    await job.updateData({
+      ...job.data,
+      progress: {
+        ...job.data.progress,
+        products: createdProducts,
+        lineItems: createdLineItems,
+      },
+    });
+  };
 
   const ov = tenant.overrides;
   const ifm = ov.input_field_map;
@@ -152,25 +185,34 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
   const lang = safeStr(readMapped(item, ifm.language)) || ov.default_lang;
   const attachLoyalty = shouldAttachLoyalty(item, ov.loyalty_rule);
 
-  const availability = await runStep(jobId, hubId, dealId, 6, 'phobs.availability', () =>
-    fetchAvailability(
-      { endpoint: tenant.phobs.endpoint },
-      {
-        lang,
-        propertyId,
-        date: fmtDate(checkInMs),
-        nights,
-        unitIds: units.map((u) => u.unitId),
-        adults: norm.adults,
-        childAges: norm.childAges,
-        accessCode: attachLoyalty ? (tenant.accessCode ?? undefined) : undefined,
-        auth: {
-          siteId: tenant.phobs.siteId,
-          username: tenant.phobs.username,
-          password: tenant.phobs.password,
+  const availability = await runStep(
+    jobId,
+    hubId,
+    dealId,
+    6,
+    'phobs.availability',
+    () =>
+      fetchAvailability(
+        { endpoint: tenant.phobs.endpoint },
+        {
+          lang,
+          propertyId,
+          date: fmtDate(checkInMs),
+          nights,
+          unitIds: units.map((u) => u.unitId),
+          adults: norm.adults,
+          childAges: norm.childAges,
+          accessCode: attachLoyalty ? (tenant.accessCode ?? undefined) : undefined,
+          auth: {
+            siteId: tenant.phobs.siteId,
+            username: tenant.phobs.username,
+            password: tenant.phobs.password,
+          },
         },
-      },
-    ),
+      ),
+    // Persist the parsed result, never the raw XML (large, and would grow
+    // job_steps without bound).
+    (r) => ({ success: r.success, sessionId: r.sessionId, rateCount: r.rates.length, rates: r.rates }),
   );
 
   // ---- Step 7: apply rate filters ------------------------------------------
@@ -283,14 +325,20 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
       dealId,
       9 + i,
       `product.upsert[${i}]`,
-      () =>
-        upsertProductBySku(hs, {
+      async () => {
+        const known = createdProducts[sku];
+        if (known) return { id: known, sku, resumed: true };
+        const p = await upsertProductBySku(hs, {
           sku,
           name: `${sel.unit.name} — ${sel.rate.name}`,
           description: sel.rate.shortDescription,
           price: sel.unit.pricePerNight,
           currency: sel.unit.currency || ov.quote_defaults.currency_fallback,
-        }),
+        });
+        createdProducts[sku] = p.id;
+        await saveProgress();
+        return { ...p, resumed: false };
+      },
     );
     productIds.push(product.id);
   }
@@ -300,14 +348,17 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
   for (let i = 0; i < offers.length; i++) {
     const sel = offers[i]!;
     const productId = productIds[i]!;
+    const liKey = `${productId}:${sel.unit.unitId}:${sel.rate.rateId}`;
     const li = await runStep(
       jobId,
       hubId,
       dealId,
       100 + i,
       `lineItem.create[${i}]`,
-      () =>
-        createLineItem(hs, {
+      async () => {
+        const known = createdLineItems[liKey];
+        if (known) return { id: known, resumed: true };
+        const created = await createLineItem(hs, {
           productId,
           dealId,
           name: `${sel.unit.name} — ${sel.rate.name}`,
@@ -315,7 +366,11 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
           price: sel.unit.pricePerNight,
           currency: sel.unit.currency || ov.quote_defaults.currency_fallback,
           description: sel.rate.shortDescription,
-        }),
+        });
+        createdLineItems[liKey] = created.id;
+        await saveProgress();
+        return { ...created, resumed: false };
+      },
     );
     lineItemIds.push(li.id);
   }
@@ -325,8 +380,10 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
     dealId: dealId.toString(),
     portalId: hubIdStr,
   });
-  const quote = await runStep(jobId, hubId, dealId, 200, 'quote.create_approve_fetch', () =>
-    createApprovedQuote(hs, {
+  const quote = await runStep(jobId, hubId, dealId, 200, 'quote.create_approve_fetch', async () => {
+    const known = job.data.progress?.quote;
+    if (known) return { ...known, resumed: true };
+    const q = await createApprovedQuote(hs, {
       dealId,
       quoteTemplateId: tenant.quoteTemplateId,
       ownerId: tenant.ownerId,
@@ -334,8 +391,13 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
       title: quoteTitle,
       expirationDays: ov.quote_defaults.expiration_days,
       currency: offers[0]!.unit.currency || ov.quote_defaults.currency_fallback,
-    }),
-  );
+    });
+    await job.updateData({
+      ...job.data,
+      progress: { ...job.data.progress, products: createdProducts, lineItems: createdLineItems, quote: q },
+    });
+    return { ...q, resumed: false };
+  });
 
   // ---- Step 11: write quote link back to deal ------------------------------
   await runStep(jobId, hubId, dealId, 201, 'deal.update.quote_link', async () => {
@@ -367,6 +429,12 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
   return { acknowledged: true, quoteId: quote.id, quoteLink: quote.link };
 }
 
+/**
+ * Runs one pipeline step with live events + job_steps persistence.
+ * `summarize` controls what is written to job_steps.output — pass it whenever
+ * the step's return value carries secrets or bulk data (raw XML) that must
+ * not be stored.
+ */
 async function runStep<T>(
   jobId: string,
   hubId: bigint,
@@ -374,6 +442,7 @@ async function runStep<T>(
   stepIndex: number,
   step: string,
   fn: () => Promise<T>,
+  summarize?: (out: T) => unknown,
 ): Promise<T> {
   const start = Date.now();
   liveEmit('jobs', hubId, {
@@ -394,7 +463,7 @@ async function runStep<T>(
       step,
       stepIndex,
       status: 'ok',
-      output,
+      output: summarize ? summarize(output) : output,
       durationMs,
     });
     jobStepDuration.labels(step, 'ok').observe(durationMs / 1000);

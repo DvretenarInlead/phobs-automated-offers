@@ -1,12 +1,17 @@
 import { useState } from 'react';
 import type { FormEvent, ReactElement } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { ApiError, login } from '../lib/api';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { describeError, login } from '../lib/api';
 import { useAuth } from '../lib/auth';
 
 export function Login(): ReactElement {
-  const { setUser } = useAuth();
+  const { setUser, expired } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+  const from = (location.state as { from?: string } | null)?.from;
+  // Never bounce back into /login or /accept-invite after signing in.
+  const target = from && !from.startsWith('/login') && !from.startsWith('/accept-invite') ? from : '/';
+
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [needsMfa, setNeedsMfa] = useState(false);
@@ -15,6 +20,15 @@ export function Login(): ReactElement {
   const [useRecovery, setUseRecovery] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  const startOver = (): void => {
+    setNeedsMfa(false);
+    setUseRecovery(false);
+    setTotpCode('');
+    setRecoveryCode('');
+    setPassword('');
+    setError(null);
+  };
 
   const submit = async (e: FormEvent): Promise<void> => {
     e.preventDefault();
@@ -37,10 +51,9 @@ export function Login(): ReactElement {
         return;
       }
       setUser(res.user);
-      navigate('/');
+      navigate(target, { replace: true });
     } catch (err) {
-      if (err instanceof ApiError) setError(err.message);
-      else setError('Unexpected error');
+      setError(describeError(err, 'Unexpected error'));
     } finally {
       setBusy(false);
     }
@@ -51,10 +64,18 @@ export function Login(): ReactElement {
       <div className="w-full max-w-sm card">
         <div className="text-emerald-400 text-sm font-semibold mb-1">Phobs Offers</div>
         <h1 className="text-xl font-semibold mb-6">Admin sign in</h1>
+        {expired && !error && (
+          <div className="text-amber-300 text-sm bg-amber-950/40 border border-amber-900 rounded px-3 py-2 mb-4">
+            Your session expired. Sign in again to continue.
+          </div>
+        )}
         <form onSubmit={submit} className="space-y-4">
           <div>
-            <label className="label">Email</label>
+            <label className="label" htmlFor="login-email">
+              Email
+            </label>
             <input
+              id="login-email"
               type="email"
               autoComplete="username"
               required
@@ -65,8 +86,11 @@ export function Login(): ReactElement {
             />
           </div>
           <div>
-            <label className="label">Password</label>
+            <label className="label" htmlFor="login-password">
+              Password
+            </label>
             <input
+              id="login-password"
               type="password"
               autoComplete="current-password"
               required
@@ -78,8 +102,11 @@ export function Login(): ReactElement {
           </div>
           {needsMfa && !useRecovery && (
             <div>
-              <label className="label">Authenticator code</label>
+              <label className="label" htmlFor="login-totp">
+                Authenticator code
+              </label>
               <input
+                id="login-totp"
                 inputMode="numeric"
                 autoComplete="one-time-code"
                 pattern="\d{6}"
@@ -101,8 +128,11 @@ export function Login(): ReactElement {
           )}
           {needsMfa && useRecovery && (
             <div>
-              <label className="label">Recovery code</label>
+              <label className="label" htmlFor="login-recovery">
+                Recovery code
+              </label>
               <input
+                id="login-recovery"
                 required
                 className="input"
                 value={recoveryCode}
@@ -126,6 +156,15 @@ export function Login(): ReactElement {
           <button type="submit" disabled={busy} className="btn-primary w-full">
             {busy ? 'Signing in…' : needsMfa ? 'Verify' : 'Sign in'}
           </button>
+          {needsMfa && (
+            <button
+              type="button"
+              className="text-xs text-slate-400 hover:text-slate-200 w-full text-center"
+              onClick={startOver}
+            >
+              Start over with a different account
+            </button>
+          )}
         </form>
       </div>
     </div>

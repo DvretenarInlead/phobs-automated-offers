@@ -4,7 +4,12 @@ import { loadConfig } from '../config.js';
 import { logger } from '../lib/logger.js';
 import { verifyHubSpotSignatureV3 } from '../hubspot/signature.js';
 import { verifyExtensionJwt, extractHubId } from '../hubspot/jwt.js';
-import { claimIdempotencyKey, idempotencyKeyFor } from '../lib/idempotency.js';
+import {
+  claimIdempotencyKey,
+  idempotencyKeyFor,
+  jobIdFor,
+  releaseIdempotencyKey,
+} from '../lib/idempotency.js';
 import { enqueueProcessDeal } from '../queue/index.js';
 import { liveEmit } from '../lib/liveEmit.js';
 import { normaliseClientIp } from '../lib/ipAllowlist.js';
@@ -30,17 +35,18 @@ const HubSpotItem = z
 
 const HubSpotPayload = z.union([z.array(HubSpotItem).min(1), HubSpotItem]);
 
-// Per-tenant webhook rate limit. HubSpot itself is rate-limited on its side,
-// so a legitimate portal will not exceed this. Keyed by portalId so a burst
-// from one tenant can't starve another, and to prevent an attacker who
-// discovers the URL from flooding us into an OOM (each request buffers up
-// to 1 MB, computes HMAC, hits Redis+DB, enqueues to BullMQ).
+// Webhook rate limit keyed by source IP + portalId. HubSpot itself is
+// rate-limited on its side, so a legitimate portal will not exceed this. The
+// IP component stops an attacker who discovers the URL pattern from minting
+// unlimited buckets by rotating portal ids (each request buffers up to 1 MB,
+// computes HMAC, hits Redis+DB, enqueues to BullMQ); the portal component
+// keeps one noisy tenant from starving another behind the same egress IP.
 const WEBHOOK_RL = {
-  max: 60,
+  max: 120,
   timeWindow: '1 minute',
   keyGenerator: (req: FastifyRequest): string => {
     const params = req.params as { portalId?: string } | undefined;
-    return `webhook:${params?.portalId ?? 'unknown'}`;
+    return `webhook:${req.ip}:${params?.portalId ?? 'unknown'}`;
   },
 };
 const EXTENSION_RL = { max: 120, timeWindow: '1 minute' };
@@ -205,8 +211,10 @@ async function handleAccepted(app: FastifyInstance, reply: FastifyReply, input: 
 
   const idemKey = idempotencyKeyFor(input.hubId, dealId, input.rawBody);
 
-  const provisionalJobId = `${input.hubId.toString()}-${dealId.toString()}-${idemKey.slice(0, 12)}`;
-  const fresh = await claimIdempotencyKey(idemKey, provisionalJobId, input.hubId);
+  // Deterministic job id derived from the idempotency key so duplicates
+  // dedupe at the queue as well as in the DB.
+  const jobIdWanted = jobIdFor(input.source, input.hubId, dealId, idemKey);
+  const fresh = await claimIdempotencyKey(idemKey, jobIdWanted, input.hubId);
   if (!fresh) {
     webhookDuplicates.labels(input.hubId.toString()).inc();
     liveEmit('webhooks', input.hubId, {
@@ -218,15 +226,23 @@ async function handleAccepted(app: FastifyInstance, reply: FastifyReply, input: 
     return reply.code(200).send({ accepted: true, duplicate: true });
   }
 
-  const jobId = await enqueueProcessDeal(
-    {
-      hubId: input.hubId.toString(),
-      source: input.source,
-      requestId: input.requestId,
-      rawPayload: parsed.data,
-    },
-    { jobId: provisionalJobId },
-  );
+  let jobId: string;
+  try {
+    jobId = await enqueueProcessDeal(
+      {
+        hubId: input.hubId.toString(),
+        source: input.source,
+        requestId: input.requestId,
+        rawPayload: parsed.data,
+      },
+      { jobId: jobIdWanted },
+    );
+  } catch (err) {
+    // Enqueue failed (Redis down): release the claim so HubSpot's retry is
+    // processed instead of being answered as a duplicate forever.
+    await releaseIdempotencyKey(idemKey).catch(() => undefined);
+    throw err;
+  }
 
   app.log.info(
     { hubId: input.hubId.toString(), dealId: dealId.toString(), jobId, requestId: input.requestId },

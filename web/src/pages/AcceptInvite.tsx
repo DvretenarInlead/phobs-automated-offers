@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { FormEvent, ReactElement } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { api, ApiError } from '../lib/api';
+import { api, describeError } from '../lib/api';
 
 interface PreviewResponse {
   email: string;
@@ -28,7 +28,7 @@ export function AcceptInvite(): ReactElement {
         const r = await api<PreviewResponse>(`/users/invite/preview?token=${encodeURIComponent(token)}`);
         setEmail(r.email);
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : 'invalid_token');
+        setError(describeError(err, 'This invite link is invalid.'));
       }
     })();
   }, [token]);
@@ -37,7 +37,11 @@ export function AcceptInvite(): ReactElement {
     e.preventDefault();
     setError(null);
     if (password !== confirm) {
-      setError('passwords do not match');
+      setError('Passwords do not match.');
+      return;
+    }
+    if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{12,}$/.test(password)) {
+      setError('Password must be at least 12 characters with upper case, lower case and a digit.');
       return;
     }
     setBusy(true);
@@ -46,7 +50,7 @@ export function AcceptInvite(): ReactElement {
       setDone(true);
       setTimeout(() => navigate('/login'), 1500);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'failed');
+      setError(describeError(err, 'failed'));
     } finally {
       setBusy(false);
     }

@@ -7,7 +7,9 @@ export default defineConfig({
   base: '/admin/',
   plugins: [react()],
   build: {
-    outDir: fileURLToPath(new URL('./dist/admin', import.meta.url)),
+    // Must not collide with tsc's output for src/admin/*.ts (dist/admin/):
+    // emptyOutDir would delete the server's auth/session modules.
+    outDir: fileURLToPath(new URL('./dist/admin-ui', import.meta.url)),
     emptyOutDir: true,
     sourcemap: true,
   },

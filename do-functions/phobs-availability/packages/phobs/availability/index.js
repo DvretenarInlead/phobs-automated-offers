@@ -23,26 +23,36 @@
  */
 
 const { XMLBuilder, XMLParser } = require('fast-xml-parser');
+const crypto = require('node:crypto');
 
-// ---------- credentials (from env) ---------------------------------------
+// ---------- credentials (from env ONLY) ----------------------------------
 //
 // PHOBS_SITE_ID / PHOBS_USERNAME / PHOBS_PASSWORD / PHOBS_ENDPOINT are set in
 // the DO Functions environment (see project.yml) and populated with secrets
 // at deploy time via `doctl serverless deploy . --env-file .env` or the DO
-// Functions UI. They never appear in the request body or the response.
+// Functions UI. They never appear in the request body or the response, and
+// they are never read from the request — a caller must not be able to point
+// this function at their own endpoint or supply their own Auth block.
 //
-// For local testing (`node index.js '{...}'`) you can either export them:
+// Local testing:
 //   PHOBS_SITE_ID=... PHOBS_USERNAME=... PHOBS_PASSWORD=... PHOBS_ENDPOINT=... \
-//     node index.js "$(cat my-input.json)"
-// or pass them inside the JSON payload — env wins if both are set.
+//     node index.js "$(cat example-input.json)"
 
-function readCreds(args) {
+function readCreds() {
   return {
-    siteId: process.env.PHOBS_SITE_ID || args.siteId || '',
-    username: process.env.PHOBS_USERNAME || args.username || '',
-    password: process.env.PHOBS_PASSWORD || args.password || '',
-    endpoint: process.env.PHOBS_ENDPOINT || args.endpoint || '',
+    siteId: process.env.PHOBS_SITE_ID || '',
+    username: process.env.PHOBS_USERNAME || '',
+    password: process.env.PHOBS_PASSWORD || '',
+    endpoint: process.env.PHOBS_ENDPOINT || '',
   };
+}
+
+function timingSafeEq(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
 }
 
 // ---------- input schema (validated by hand — no external deps) ----------
@@ -69,12 +79,24 @@ function validate(args, creds) {
   if (args.adults !== undefined && (!Number.isFinite(args.adults) || args.adults < 0)) {
     errors.push('adults must be a non-negative number');
   }
-  if (args.childAges && !Array.isArray(args.childAges)) {
-    errors.push('childAges must be an array of numbers');
+  if (
+    args.childAges !== undefined &&
+    (!Array.isArray(args.childAges) ||
+      args.childAges.length > 10 ||
+      !args.childAges.every((n) => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 17))
+  ) {
+    errors.push('childAges must be an array of up to 10 numbers (0-17)');
   }
-  if (args.unitIds && !Array.isArray(args.unitIds)) {
-    errors.push('unitIds must be an array of strings');
+  if (
+    args.unitIds !== undefined &&
+    (!Array.isArray(args.unitIds) ||
+      args.unitIds.length > 50 ||
+      !args.unitIds.every((u) => typeof u === 'string' && u.length > 0 && u.length <= 64))
+  ) {
+    errors.push('unitIds must be an array of up to 50 strings');
   }
+  if (args.nights !== undefined && args.nights > 60) errors.push('nights must be <= 60');
+  if (args.adults !== undefined && args.adults > 20) errors.push('adults must be <= 20');
   if (creds.endpoint) {
     try {
       const u = new URL(creds.endpoint);
@@ -254,7 +276,21 @@ async function post(url, body, timeoutMs) {
  */
 async function main(args) {
   const started = Date.now();
-  const creds = readCreds(args);
+
+  // Bearer gate. The function is exposed on a public URL; without a token
+  // it would be an open relay for Phobs queries on the tenant's account.
+  const apiToken = process.env.API_TOKEN || '';
+  if (!apiToken) {
+    return { statusCode: 500, body: { error: 'server_misconfigured', message: 'API_TOKEN not set' } };
+  }
+  const headers = args.__ow_headers || {};
+  const auth = headers.authorization || '';
+  const supplied = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  if (!timingSafeEq(supplied, apiToken)) {
+    return { statusCode: 401, body: { error: 'unauthorized' } };
+  }
+
+  const creds = readCreds();
   const errors = validate(args, creds);
   if (errors.length > 0) {
     return {
@@ -329,9 +365,9 @@ async function main(args) {
       rateCount: parsed.rates.length,
       unitCount: parsed.rates.reduce((sum, r) => sum + r.units.length, 0),
       latencyMs: Date.now() - started,
-      // Include the request XML in debug mode for troubleshooting; never in
-      // prod because it contains the Phobs credentials.
-      ...(args.debug ? { requestXml: xmlRequest } : {}),
+      // The request XML is never returned: it contains the Phobs credentials.
+      // For response-shape debugging, the raw *response* is available:
+      ...(args.includeRawXml ? { rawXml: httpRes.text.slice(0, 50_000) } : {}),
     },
   };
 }

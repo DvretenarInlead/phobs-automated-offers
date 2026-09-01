@@ -16,9 +16,15 @@ export class SignatureError extends AppError {
   }
 }
 
+/**
+ * Authentication / authorisation failure. `reason` is a short machine code
+ * (`bad_credentials`, `bad_csrf`, `forbidden`, …) that is safe to show to the
+ * caller and doubles as the response `error` field. Pass 403 for
+ * authorisation failures (authenticated but not allowed).
+ */
 export class AuthError extends AppError {
-  constructor(message = 'Unauthorized') {
-    super(message, 401, 'unauthorized');
+  constructor(reason = 'unauthorized', statusCode: 401 | 403 = 401) {
+    super(reason, statusCode, reason);
   }
 }
 
@@ -69,4 +75,13 @@ export function isRetryable(err: unknown): boolean {
     return false;
   }
   return true; // unknown errors → retry conservatively
+}
+
+/** Postgres unique-violation detector (postgres.js surfaces `code`). */
+export function isUniqueViolation(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { code?: unknown }).code === '23505'
+  );
 }

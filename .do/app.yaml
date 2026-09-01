@@ -3,6 +3,26 @@ region: fra
 features:
   - buildpack-stack=ubuntu-22
 
+# Secrets (type: SECRET) are set once in the DO console / doctl and never
+# committed. Generate the two 32-byte keys with:
+#   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+#
+# Both runtime components import the same config module, so the worker needs
+# the same env set as the web service (it validates all of it at boot).
+
+# Runs before every deploy, against the managed Postgres. Only needs
+# DATABASE_URL — src/cli/migrate.ts deliberately does not load app config.
+jobs:
+  - name: migrate
+    kind: PRE_DEPLOY
+    dockerfile_path: Dockerfile
+    instance_size_slug: basic-xxs
+    run_command: node dist/cli/migrate.js
+    envs:
+      - { key: NODE_ENV, value: production }
+      - { key: DATABASE_URL, scope: RUN_TIME, value: ${db.DATABASE_URL} }
+      - { key: DATABASE_CA_CERT, scope: RUN_TIME, value: ${db.CA_CERT} }
+
 services:
   - name: web
     dockerfile_path: Dockerfile
@@ -21,9 +41,11 @@ services:
     envs:
       - { key: NODE_ENV, value: production }
       - { key: PORT, value: '8080' }
-      - { key: PUBLIC_BASE_URL, scope: RUN_TIME, value: ${APP_URL} }
       - { key: LOG_LEVEL, value: info }
+      - { key: PUBLIC_BASE_URL, scope: RUN_TIME, value: ${APP_URL} }
+      - { key: TRUST_PROXY_HOPS, value: '1' }
       - { key: DATABASE_URL, scope: RUN_TIME, value: ${db.DATABASE_URL} }
+      - { key: DATABASE_CA_CERT, scope: RUN_TIME, value: ${db.CA_CERT} }
       - { key: REDIS_URL, scope: RUN_TIME, value: ${redis.DATABASE_URL} }
       - { key: TOKEN_VAULT_KEY, type: SECRET, scope: RUN_TIME }
       - { key: TOKEN_VAULT_KEY_PREV, type: SECRET, scope: RUN_TIME }
@@ -31,9 +53,20 @@ services:
       - { key: HUBSPOT_CLIENT_ID, type: SECRET, scope: RUN_TIME }
       - { key: HUBSPOT_CLIENT_SECRET, type: SECRET, scope: RUN_TIME }
       - { key: HUBSPOT_APP_ID, type: SECRET, scope: RUN_TIME }
-      - { key: HUBSPOT_REDIRECT_URI, scope: RUN_TIME }
-      - { key: HUBSPOT_SCOPES, scope: RUN_TIME }
+      - { key: HUBSPOT_REDIRECT_URI, scope: RUN_TIME, value: ${APP_URL}/oauth/callback }
+      - key: HUBSPOT_SCOPES
+        scope: RUN_TIME
+        value: crm.objects.deals.read crm.objects.deals.write crm.objects.line_items.read crm.objects.line_items.write crm.objects.quotes.read crm.objects.quotes.write crm.objects.products.read crm.objects.products.write hubdb
+      # Comma-separated CIDRs allowed to reach /admin and /api/admin. Empty =
+      # no IP restriction (auth + MFA still apply). Strongly recommended.
       - { key: ADMIN_IP_ALLOWLIST, scope: RUN_TIME }
+      # Bearer token for /metrics (Prometheus scrape). Unset = localhost only.
+      - { key: METRICS_TOKEN, type: SECRET, scope: RUN_TIME }
+      # Optional: override only if your HubSpot region uses a different JWKS.
+      # - { key: HUBSPOT_JWKS_URL, value: https://api.hubapi.com/.well-known/jwks.json }
+      # Optional OpenTelemetry (off when unset).
+      # - { key: OTEL_EXPORTER_OTLP_ENDPOINT, value: https://otlp.example }
+      # - { key: OTEL_EXPORTER_OTLP_HEADERS, type: SECRET }
 
 workers:
   - name: worker
@@ -44,12 +77,23 @@ workers:
     envs:
       - { key: NODE_ENV, value: production }
       - { key: LOG_LEVEL, value: info }
+      - { key: PUBLIC_BASE_URL, scope: RUN_TIME, value: ${APP_URL} }
+      - { key: TRUST_PROXY_HOPS, value: '1' }
       - { key: DATABASE_URL, scope: RUN_TIME, value: ${db.DATABASE_URL} }
+      - { key: DATABASE_CA_CERT, scope: RUN_TIME, value: ${db.CA_CERT} }
       - { key: REDIS_URL, scope: RUN_TIME, value: ${redis.DATABASE_URL} }
       - { key: TOKEN_VAULT_KEY, type: SECRET, scope: RUN_TIME }
       - { key: TOKEN_VAULT_KEY_PREV, type: SECRET, scope: RUN_TIME }
+      - { key: SESSION_SECRET, type: SECRET, scope: RUN_TIME }
       - { key: HUBSPOT_CLIENT_ID, type: SECRET, scope: RUN_TIME }
       - { key: HUBSPOT_CLIENT_SECRET, type: SECRET, scope: RUN_TIME }
+      - { key: HUBSPOT_APP_ID, type: SECRET, scope: RUN_TIME }
+      - { key: HUBSPOT_REDIRECT_URI, scope: RUN_TIME, value: ${APP_URL}/oauth/callback }
+      - key: HUBSPOT_SCOPES
+        scope: RUN_TIME
+        value: crm.objects.deals.read crm.objects.deals.write crm.objects.line_items.read crm.objects.line_items.write crm.objects.quotes.read crm.objects.quotes.write crm.objects.products.read crm.objects.products.write hubdb
+      # - { key: OTEL_EXPORTER_OTLP_ENDPOINT, value: https://otlp.example }
+      # - { key: OTEL_EXPORTER_OTLP_HEADERS, type: SECRET }
 
 databases:
   - name: db

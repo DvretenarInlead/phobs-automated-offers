@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { FormEvent, ReactElement } from 'react';
 import QRCode from 'qrcode';
-import { api, ApiError } from '../lib/api';
+import { api, describeError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 
 interface TotpSetupResponse {
@@ -23,7 +23,10 @@ export function Settings(): ReactElement {
         {user?.role === 'superadmin' ? 'Superadmin' : `Tenant admin (hub ${user?.scopedHubId})`}
       </div>
       <ChangePassword />
-      <TotpSection onChanged={refresh} />
+      <TotpSection
+        enabled={Boolean(user?.totpEnabled)}
+        onChanged={() => refresh({ background: true })}
+      />
     </div>
   );
 }
@@ -41,7 +44,11 @@ function ChangePassword(): ReactElement {
     setError(null);
     setDone(false);
     if (next !== confirm) {
-      setError('passwords do not match');
+      setError('Passwords do not match.');
+      return;
+    }
+    if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{12,}$/.test(next)) {
+      setError('Password must be at least 12 characters with upper case, lower case and a digit.');
       return;
     }
     setBusy(true);
@@ -52,7 +59,7 @@ function ChangePassword(): ReactElement {
       setNext('');
       setConfirm('');
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'failed');
+      setError(describeError(err, 'failed'));
     } finally {
       setBusy(false);
     }
@@ -63,8 +70,11 @@ function ChangePassword(): ReactElement {
       <h2 className="font-semibold mb-4">Change password</h2>
       <form onSubmit={submit} className="space-y-4 max-w-md">
         <div>
-          <label className="label">Current password</label>
+          <label className="label" htmlFor="pw-current">
+            Current password
+          </label>
           <input
+            id="pw-current"
             type="password"
             autoComplete="current-password"
             className="input"
@@ -74,8 +84,11 @@ function ChangePassword(): ReactElement {
           />
         </div>
         <div>
-          <label className="label">New password (≥ 12 chars, mixed case + digit)</label>
+          <label className="label" htmlFor="pw-next">
+            New password (≥ 12 chars, mixed case + digit)
+          </label>
           <input
+            id="pw-next"
             type="password"
             autoComplete="new-password"
             className="input"
@@ -85,8 +98,11 @@ function ChangePassword(): ReactElement {
           />
         </div>
         <div>
-          <label className="label">Confirm new password</label>
+          <label className="label" htmlFor="pw-confirm">
+            Confirm new password
+          </label>
           <input
+            id="pw-confirm"
             type="password"
             autoComplete="new-password"
             className="input"
@@ -97,7 +113,7 @@ function ChangePassword(): ReactElement {
         </div>
         {error && <div className="text-rose-400 text-sm">{error}</div>}
         {done && <div className="text-emerald-400 text-sm">Password changed.</div>}
-        <button className="btn-primary" disabled={busy}>
+        <button type="submit" className="btn-primary" disabled={busy}>
           {busy ? 'Saving…' : 'Change password'}
         </button>
       </form>
@@ -105,13 +121,20 @@ function ChangePassword(): ReactElement {
   );
 }
 
-function TotpSection({ onChanged }: { onChanged: () => Promise<void> }): ReactElement {
+function TotpSection({
+  enabled,
+  onChanged,
+}: {
+  enabled: boolean;
+  onChanged: () => Promise<void>;
+}): ReactElement {
   const [setupData, setSetupData] = useState<TotpSetupResponse | null>(null);
   const [qrUrl, setQrUrl] = useState<string | null>(null);
   const [code, setCode] = useState('');
   const [recovery, setRecovery] = useState<string[] | null>(null);
   const [disablePassword, setDisablePassword] = useState('');
   const [disableCode, setDisableCode] = useState('');
+  const [disableRecovery, setDisableRecovery] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -124,7 +147,7 @@ function TotpSection({ onChanged }: { onChanged: () => Promise<void> }): ReactEl
       const png = await QRCode.toDataURL(r.otpauthUri, { margin: 1, scale: 6 });
       setQrUrl(png);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'failed');
+      setError(describeError(err, 'failed'));
     } finally {
       setBusy(false);
     }
@@ -135,13 +158,15 @@ function TotpSection({ onChanged }: { onChanged: () => Promise<void> }): ReactEl
     setBusy(true);
     try {
       const r = await api<TotpConfirmResponse>('/totp/confirm', { method: 'POST', body: { code } });
+      // Recovery codes are shown exactly once — keep them in local state and
+      // only refresh /me in the background so this component stays mounted.
       setRecovery(r.recoveryCodes);
       setSetupData(null);
       setQrUrl(null);
       setCode('');
       await onChanged();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'failed');
+      setError(describeError(err, 'failed'));
     } finally {
       setBusy(false);
     }
@@ -153,13 +178,19 @@ function TotpSection({ onChanged }: { onChanged: () => Promise<void> }): ReactEl
     try {
       await api('/totp/disable', {
         method: 'POST',
-        body: { password: disablePassword, code: disableCode || undefined },
+        body: {
+          password: disablePassword,
+          code: disableCode || undefined,
+          recoveryCode: disableRecovery || undefined,
+        },
       });
       setDisablePassword('');
       setDisableCode('');
+      setDisableRecovery('');
+      setRecovery(null);
       await onChanged();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'failed');
+      setError(describeError(err, 'failed'));
     } finally {
       setBusy(false);
     }
@@ -167,59 +198,33 @@ function TotpSection({ onChanged }: { onChanged: () => Promise<void> }): ReactEl
 
   return (
     <section className="card">
-      <h2 className="font-semibold mb-4">Two-factor authentication</h2>
+      <div className="flex items-center gap-3 mb-4">
+        <h2 className="font-semibold">Two-factor authentication</h2>
+        <span className={enabled ? 'pill-ok' : 'pill-warn'}>{enabled ? 'enabled' : 'off'}</span>
+      </div>
       {error && <div className="text-rose-400 text-sm mb-4">{error}</div>}
 
       {recovery && (
         <div className="border border-amber-700 bg-amber-950/30 rounded p-4 mb-4">
           <div className="font-medium text-amber-300 mb-2">
-            Save these recovery codes now. Shown once.
+            Save these recovery codes now. They are shown once and each works one time.
           </div>
           <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-sm">
             {recovery.map((c) => (
               <div key={c}>{c}</div>
             ))}
           </div>
+          <button
+            type="button"
+            className="btn-secondary text-xs mt-3"
+            onClick={() => setRecovery(null)}
+          >
+            I have saved them
+          </button>
         </div>
       )}
 
-      {!setupData ? (
-        <>
-          <p className="text-slate-400 text-sm mb-4">
-            TOTP-based MFA using an app like 1Password, Bitwarden, or Authy.
-          </p>
-          <button className="btn-secondary" onClick={beginSetup} disabled={busy}>
-            {busy ? '…' : 'Set up authenticator app'}
-          </button>
-
-          <div className="mt-6 pt-6 border-t border-slate-800">
-            <h3 className="font-medium mb-2 text-sm">Disable TOTP</h3>
-            <p className="text-slate-500 text-xs mb-3">
-              Requires your current password and a current authenticator code.
-            </p>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <input
-                type="password"
-                placeholder="Password"
-                className="input"
-                value={disablePassword}
-                onChange={(e) => setDisablePassword(e.target.value)}
-              />
-              <input
-                inputMode="numeric"
-                placeholder="6-digit code"
-                className="input"
-                value={disableCode}
-                onChange={(e) => setDisableCode(e.target.value.replace(/\D/g, ''))}
-                maxLength={6}
-              />
-              <button className="btn-danger" onClick={disable} disabled={busy || !disablePassword}>
-                Disable
-              </button>
-            </div>
-          </div>
-        </>
-      ) : (
+      {setupData ? (
         <div className="space-y-4">
           <p className="text-sm text-slate-300">
             Scan this QR with your authenticator app, then enter the 6-digit code it shows.
@@ -241,8 +246,11 @@ function TotpSection({ onChanged }: { onChanged: () => Promise<void> }): ReactEl
           </details>
           <div className="flex gap-3 items-end">
             <div className="flex-1">
-              <label className="label">Code from your app</label>
+              <label className="label" htmlFor="totp-code">
+                Code from your app
+              </label>
               <input
+                id="totp-code"
                 inputMode="numeric"
                 maxLength={6}
                 className="input tracking-widest text-center text-lg"
@@ -252,11 +260,78 @@ function TotpSection({ onChanged }: { onChanged: () => Promise<void> }): ReactEl
               />
             </div>
             <button
+              type="button"
               className="btn-primary"
               onClick={confirm}
               disabled={busy || code.length !== 6}
             >
               Enable
+            </button>
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => {
+                setSetupData(null);
+                setQrUrl(null);
+                setCode('');
+              }}
+              disabled={busy}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : !enabled ? (
+        <>
+          <p className="text-slate-400 text-sm mb-4">
+            TOTP-based MFA using an app like 1Password, Bitwarden, or Authy. Strongly recommended
+            for every admin account.
+          </p>
+          <button type="button" className="btn-secondary" onClick={beginSetup} disabled={busy}>
+            {busy ? '…' : 'Set up authenticator app'}
+          </button>
+        </>
+      ) : (
+        <div>
+          <h3 className="font-medium mb-2 text-sm">Disable TOTP</h3>
+          <p className="text-slate-500 text-xs mb-3">
+            Requires your current password and a current authenticator code (or one unused
+            recovery code). To re-enrol on a new device, disable first, then set up again.
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+            <input
+              type="password"
+              placeholder="Password"
+              aria-label="Password"
+              autoComplete="current-password"
+              className="input"
+              value={disablePassword}
+              onChange={(e) => setDisablePassword(e.target.value)}
+            />
+            <input
+              inputMode="numeric"
+              placeholder="6-digit code"
+              aria-label="Authenticator code"
+              className="input"
+              value={disableCode}
+              onChange={(e) => setDisableCode(e.target.value.replace(/\D/g, ''))}
+              maxLength={6}
+            />
+            <input
+              placeholder="or recovery code"
+              aria-label="Recovery code"
+              className="input font-mono"
+              value={disableRecovery}
+              onChange={(e) => setDisableRecovery(e.target.value.trim())}
+              maxLength={64}
+            />
+            <button
+              type="button"
+              className="btn-danger"
+              onClick={disable}
+              disabled={busy || !disablePassword || (!disableCode && !disableRecovery)}
+            >
+              Disable
             </button>
           </div>
         </div>

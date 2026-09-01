@@ -71,18 +71,34 @@ function verifyState(state: string, maxAgeMs = 10 * 60 * 1000): { nonce: string 
 
 export const rateLimits = { OAUTH_RL };
 
+// The state nonce is also pinned to the installing browser via a short-lived
+// cookie, so a state minted by someone else (or replayed within its 10 min
+// TTL) is rejected on callback. SameSite=Lax is required: the callback is a
+// top-level GET navigation coming back from app.hubspot.com.
+const OAUTH_NONCE_COOKIE = '__Host-oauth_nonce';
+const OAUTH_NONCE_COOKIE_OPTS = {
+  path: '/',
+  httpOnly: true,
+  secure: true,
+  sameSite: 'lax' as const,
+  maxAge: 10 * 60,
+};
+
 export function registerOAuthRoutes(app: FastifyInstance): void {
   app.get(
     '/oauth/install',
     { config: { rateLimit: OAUTH_RL } },
     (_req, reply) => {
-      const state = signState({ nonce: randomBytes(16).toString('hex'), ts: Date.now() });
+      const nonce = randomBytes(16).toString('hex');
+      const state = signState({ nonce, ts: Date.now() });
       const url = new URL(HUBSPOT_AUTH_URL);
       url.searchParams.set('client_id', config.HUBSPOT_CLIENT_ID);
       url.searchParams.set('redirect_uri', config.HUBSPOT_REDIRECT_URI);
       url.searchParams.set('scope', config.hubspotScopes.join(' '));
       url.searchParams.set('state', state);
-      return reply.redirect(url.toString(), 302);
+      return reply
+        .setCookie(OAUTH_NONCE_COOKIE, nonce, OAUTH_NONCE_COOKIE_OPTS)
+        .redirect(url.toString(), 302);
     },
   );
 
@@ -95,7 +111,18 @@ export function registerOAuthRoutes(app: FastifyInstance): void {
       // client-controlled text.
       if (error) return reply.code(400).send({ error: 'oauth_error' });
       if (!code || !state) return reply.code(400).send({ error: 'missing_code_or_state' });
-      if (!verifyState(state)) return reply.code(400).send({ error: 'bad_state' });
+      const verified = verifyState(state);
+      if (!verified) return reply.code(400).send({ error: 'bad_state' });
+      const cookieNonce = req.cookies?.[OAUTH_NONCE_COOKIE];
+      if (
+        typeof cookieNonce !== 'string' ||
+        cookieNonce.length !== verified.nonce.length ||
+        !timingSafeEqual(Buffer.from(cookieNonce), Buffer.from(verified.nonce))
+      ) {
+        logger.warn({ ip: req.ip }, 'oauth callback: state not bound to this browser');
+        return reply.code(400).send({ error: 'bad_state' });
+      }
+      void reply.clearCookie(OAUTH_NONCE_COOKIE, { ...OAUTH_NONCE_COOKIE_OPTS, maxAge: undefined });
 
       // Exchange code for tokens
       const tokens = await exchangeCode(code);

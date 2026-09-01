@@ -133,10 +133,14 @@ doctl serverless deploy . --env .env
 | `PHOBS_SITE_ID` | ✓ | Goes into `<Auth><SiteId>` |
 | `PHOBS_USERNAME` | ✓ | Goes into `<Auth><Username>` |
 | `PHOBS_PASSWORD` | ✓ | Goes into `<Auth><Password>` |
+| `API_TOKEN` | ✓ | Bearer token callers must present. Generate with `openssl rand -base64 32`. |
+| `HUBSPOT_ACCESS_TOKEN` | sync-line-items | HubSpot Private App token |
+| `WRITEBACK_STATUS` | ○ | `false` to skip the deal status writeback (sync-line-items) |
 
-The handler ignores any `endpoint` / `siteId` / `username` / `password`
-fields that appear in the request body **if** the env var is set. This makes
-it impossible to override credentials by injecting them via query string.
+Credentials are read from the environment only. `endpoint` / `siteId` /
+`username` / `password` fields in the request body are ignored, so a caller
+can neither redirect the function to another host nor substitute their own
+Phobs account.
 
 ## Input schema (request body)
 
@@ -152,7 +156,12 @@ it impossible to override credentials by injecting them via query string.
 | `accessCode` | string | ○ | Loyalty / partner access code |
 | `includeRestricted` | bool | ○ | Defaults to `false` |
 | `timeoutMs` | number | ○ | HTTP timeout, default 15000 |
-| `debug` | bool | ○ | Include the request XML in the response (**leaks credentials — dev only**) |
+| `includeRawXml` | bool | ○ | Include the raw *response* XML (first 50 kB) for shape debugging. The request XML is never returned — it contains the credentials. |
+
+Both actions require `Authorization: Bearer <API_TOKEN>` (see env table). The
+`availability` action refuses to run at all (`500 server_misconfigured`) when
+`API_TOKEN` is unset, so a deploy can never accidentally expose an open Phobs
+relay.
 
 ## Output
 
@@ -255,7 +264,11 @@ creates a second set of line items.
   responses containing external entities (`<!DOCTYPE … [<!ENTITY xxe SYSTEM
   …>]>`) fail fast instead of exfiltrating files. Same defence as the main
   service.
-- Don't leave `"debug": true` in production input — it echoes the request XML
-  (which contains the credentials) in the response.
-- For long-lived exposure over HTTPS, set `webSecure: true` in `project.yml`
-  and pass `X-Require-Whisk-Auth: <secret>` on every call.
+- The request XML (which contains the credentials) is never echoed. Only the
+  raw *response* can be returned, and only when `includeRawXml` is set.
+- Both actions are gated by `API_TOKEN` (timing-safe bearer compare). You can
+  additionally set `webSecure: true` in `project.yml` and pass
+  `X-Require-Whisk-Auth: <secret>` for a second, platform-level gate.
+- Array inputs are typed strictly (`childAges`: numbers 0–17, `unitIds`:
+  strings) and capped, so a caller cannot smuggle nested elements into the
+  XML through the builder.

@@ -170,6 +170,8 @@ export const adminUsers = pgTable(
     totpSecretIv: bytea('totp_secret_iv'),
     totpSecretTag: bytea('totp_secret_tag'),
     totpEnabled: boolean('totp_enabled').notNull().default(false),
+    /** Last accepted TOTP time-step — codes at or before it are rejected (replay). */
+    totpLastStep: bigint('totp_last_step', { mode: 'number' }),
     recoveryHashes: text('recovery_hashes').array().notNull().default(sql`'{}'::text[]`),
     role: text('role').notNull(),
     scopedHubId: bigint('scoped_hub_id', { mode: 'bigint' }),

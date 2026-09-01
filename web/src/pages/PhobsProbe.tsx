@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { api, ApiError } from '../lib/api';
+import { api, describeError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 
 interface ProbeUnit {
@@ -102,7 +102,7 @@ export function PhobsProbe(): ReactElement {
       });
       setResult(res);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'probe_failed');
+      setError(describeError(err, 'probe_failed'));
     } finally {
       setBusy(false);
     }
@@ -173,7 +173,7 @@ export function PhobsProbe(): ReactElement {
               max={60}
               className="input"
               value={nights}
-              onChange={(e) => setNights(Number(e.target.value))}
+              onChange={(e) => setNights(Math.max(1, Number(e.target.value) || 1))}
             />
           </Field>
           <Field label="Adults">
@@ -183,7 +183,7 @@ export function PhobsProbe(): ReactElement {
               max={20}
               className="input"
               value={adults}
-              onChange={(e) => setAdults(Number(e.target.value))}
+              onChange={(e) => setAdults(Math.max(0, Number(e.target.value) || 0))}
             />
           </Field>
           <Field label="Child ages (comma-separated)">

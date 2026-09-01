@@ -164,9 +164,16 @@ connectivity.
 
 ## Security notes
 
-- Bearer token on `/run` is compared with a timing-safe equality check. If
-  `API_TOKEN` is unset the endpoint is open — put your own auth (mTLS, Cloud
-  Run IAM, API Gateway, etc.) in front, or set the token.
+- Bearer token on `/run` is compared with a timing-safe equality check. The
+  service **refuses to start** without `API_TOKEN`; set
+  `ALLOW_UNAUTHENTICATED=true` only when an upstream layer (mTLS, Cloud Run
+  IAM, API Gateway) authenticates callers for you. Auth is checked before
+  anything else, so unauthenticated callers learn nothing about the
+  deployment.
+- Array inputs are typed strictly (`childAges`: numbers 0–17, `unitIds`:
+  strings) and capped (`maxResults` ≤ 50, `expirationDays` ≤ 365,
+  `nights` ≤ 60) so a caller cannot smuggle nested elements into the XML or
+  create unbounded numbers of CRM objects per call.
 - Body cap is 128 KiB — booking payloads are typically < 1 KiB.
 - The Phobs endpoint must be `https://`. External-entity resolution is
   disabled in the XML parser (no XXE).

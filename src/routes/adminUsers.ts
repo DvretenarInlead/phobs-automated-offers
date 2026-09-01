@@ -12,10 +12,12 @@ import {
   findRecoveryMatch,
   generateRecoveryCodes,
   generateTotp,
-  verifyTotp,
+  verifyTotpOnce,
 } from '../admin/totp.js';
+import { SESSION_COOKIE_NAME, revokeAllSessions, revokeOtherSessions } from '../admin/sessions.js';
+import { unlockAccount } from '../admin/rateLimit.js';
 import { openUtf8, seal } from '../crypto/tokenVault.js';
-import { AuthError, AppError } from '../lib/errors.js';
+import { AuthError, AppError, isUniqueViolation } from '../lib/errors.js';
 
 const config = loadConfig();
 const PENDING_PASSWORD = '!pending!'; // hashed, never matches; sentinel only
@@ -62,16 +64,24 @@ export function registerAdminUserRoutes(app: FastifyInstance, prefix = '/api/adm
       // Insert pending user (status='pending'); the sentinel hash will never
       // verify until they accept the invite and set a real password.
       const pendingHash = await hashPassword(PENDING_PASSWORD);
-      const [inserted] = await db
-        .insert(adminUsers)
-        .values({
-          email: body.email,
-          passwordHash: pendingHash,
-          role: 'tenant_admin',
-          scopedHubId: hubId,
-          status: 'pending',
-        })
-        .returning({ id: adminUsers.id, email: adminUsers.email });
+      let inserted: { id: bigint; email: string } | undefined;
+      try {
+        [inserted] = await db
+          .insert(adminUsers)
+          .values({
+            email: body.email,
+            passwordHash: pendingHash,
+            role: 'tenant_admin',
+            scopedHubId: hubId,
+            status: 'pending',
+          })
+          .returning({ id: adminUsers.id, email: adminUsers.email });
+      } catch (err) {
+        // Superadmin-only route, so telling them the email already exists is
+        // not an enumeration oracle — it's the useful answer.
+        if (isUniqueViolation(err)) return reply.code(409).send({ error: 'email_exists' });
+        throw err;
+      }
       if (!inserted) return reply.code(500).send({ error: 'insert_failed' });
 
       const token = signInvite({
@@ -154,6 +164,16 @@ export function registerAdminUserRoutes(app: FastifyInstance, prefix = '/api/adm
   app.post(`${prefix}/totp/setup`, async (req, reply) => {
     const user = req.adminUser;
     if (!user) throw new AuthError('unauthenticated');
+    // Never let "set up" silently downgrade an account that already has MFA:
+    // an enabled authenticator must be disabled first (password + code).
+    const [current] = await db
+      .select({ totpEnabled: adminUsers.totpEnabled })
+      .from(adminUsers)
+      .where(eq(adminUsers.id, user.id))
+      .limit(1);
+    if (current?.totpEnabled) {
+      throw new AppError('totp_already_enabled', 409, 'totp_already_enabled');
+    }
     const t = generateTotp(user.email);
     const sealed = seal(t.base32Secret, `admin_totp:${user.id}`);
     // Stage the secret on the row but do NOT flip totpEnabled until confirm.
@@ -188,13 +208,17 @@ export function registerAdminUserRoutes(app: FastifyInstance, prefix = '/api/adm
       { ct: row.totpSecretCt, iv: row.totpSecretIv, tag: row.totpSecretTag },
       `admin_totp:${user.id}`,
     );
-    if (!verifyTotp(secret, code)) throw new AuthError('bad_totp');
+    const step = verifyTotpOnce(secret, code, row.totpLastStep ?? null);
+    if (step === null) throw new AuthError('bad_totp');
 
     const { plain, hashes } = generateRecoveryCodes();
     await db
       .update(adminUsers)
-      .set({ totpEnabled: true, recoveryHashes: hashes })
+      .set({ totpEnabled: true, recoveryHashes: hashes, totpLastStep: step })
       .where(eq(adminUsers.id, user.id));
+
+    // Enabling MFA is a credential change: other sessions must re-authenticate.
+    await revokeOtherSessions(user.id, req.cookies?.[SESSION_COOKIE_NAME]);
 
     await writeAdminAudit({
       adminUserId: user.id,
@@ -223,7 +247,9 @@ export function registerAdminUserRoutes(app: FastifyInstance, prefix = '/api/adm
           { ct: row.totpSecretCt, iv: row.totpSecretIv, tag: row.totpSecretTag },
           `admin_totp:${user.id}`,
         );
-        if (!verifyTotp(secret, body.code)) throw new AuthError('bad_totp');
+        if (verifyTotpOnce(secret, body.code, row.totpLastStep ?? null) === null) {
+          throw new AuthError('bad_totp');
+        }
       } else if (body.recoveryCode) {
         if (findRecoveryMatch(row.recoveryHashes, body.recoveryCode) < 0) {
           throw new AuthError('bad_recovery_code');
@@ -240,9 +266,12 @@ export function registerAdminUserRoutes(app: FastifyInstance, prefix = '/api/adm
         totpSecretCt: null,
         totpSecretIv: null,
         totpSecretTag: null,
+        totpLastStep: null,
         recoveryHashes: [],
       })
       .where(eq(adminUsers.id, user.id));
+
+    await revokeOtherSessions(user.id, req.cookies?.[SESSION_COOKIE_NAME]);
 
     await writeAdminAudit({
       adminUserId: user.id,
@@ -264,13 +293,40 @@ export function registerAdminUserRoutes(app: FastifyInstance, prefix = '/api/adm
     }
     const hash = await hashPassword(body.next);
     await db.update(adminUsers).set({ passwordHash: hash }).where(eq(adminUsers.id, user.id));
+    // Rotating the password ends every other session (stolen-cookie recovery).
+    const revoked = await revokeOtherSessions(user.id, req.cookies?.[SESSION_COOKIE_NAME]);
     await writeAdminAudit({
       adminUserId: user.id,
       action: 'password.changed',
       ip: req.ip,
+      after: { otherSessionsRevoked: revoked },
     });
-    return reply.send({ ok: true });
+    return reply.send({ ok: true, otherSessionsRevoked: revoked });
   });
+
+  // --- Superadmin: clear login lock-outs for a user ------------------------
+  app.post(
+    `${prefix}/users/:id/unlock`,
+    { preHandler: requireRole('superadmin', { allowSuperadmin: false }) },
+    async (req, reply) => {
+      const { id } = z.object({ id: z.string().regex(/^\d+$/) }).parse(req.params);
+      const [target] = await db
+        .select({ email: adminUsers.email })
+        .from(adminUsers)
+        .where(eq(adminUsers.id, BigInt(id)))
+        .limit(1);
+      if (!target) return reply.code(404).send({ error: 'user_not_found' });
+      const cleared = await unlockAccount(target.email);
+      await writeAdminAudit({
+        adminUserId: req.adminUser!.id,
+        action: 'user.unlock',
+        target: `admin_user_id=${id}`,
+        ip: req.ip,
+        after: { countersCleared: cleared },
+      });
+      return reply.send({ ok: true, countersCleared: cleared });
+    },
+  );
 
   // --- Superadmin: list admin users ---------------------------------------
   app.get(
@@ -307,6 +363,9 @@ export function registerAdminUserRoutes(app: FastifyInstance, prefix = '/api/adm
         .update(adminUsers)
         .set({ status: 'disabled' })
         .where(eq(adminUsers.id, userId));
+      // Sessions already fail on status!=='active'; delete them anyway so
+      // nothing lingers in the table.
+      await revokeAllSessions(userId);
       await writeAdminAudit({
         adminUserId: req.adminUser!.id,
         action: 'user.deactivate',

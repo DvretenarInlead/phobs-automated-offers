@@ -23,9 +23,16 @@ export function Layout(): ReactElement {
   const navigate = useNavigate();
 
   const onLogout = async (): Promise<void> => {
-    await logout();
-    setUser(null);
-    navigate('/login');
+    // If the session already expired, /logout answers 401 — still clear the
+    // client state and leave; never strand the user on a dead page.
+    try {
+      await logout();
+    } catch {
+      /* ignore */
+    } finally {
+      setUser(null);
+      navigate('/login');
+    }
   };
 
   return (

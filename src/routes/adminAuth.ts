@@ -6,7 +6,7 @@ import { adminUsers } from '../db/schema.js';
 import { logger } from '../lib/logger.js';
 import { AuthError } from '../lib/errors.js';
 import { hashPassword, verifyPassword } from '../admin/passwords.js';
-import { findRecoveryMatch, verifyTotp } from '../admin/totp.js';
+import { findRecoveryMatch, verifyTotpOnce } from '../admin/totp.js';
 import { openUtf8, seal } from '../crypto/tokenVault.js';
 import {
   SESSION_COOKIE_NAME,
@@ -24,6 +24,7 @@ import {
   LOGIN_HARD_LOCK,
   applyLoginBackoff,
   bumpLoginFailure,
+  getLoginFailures,
   resetLoginFailures,
 } from '../admin/rateLimit.js';
 import { writeAdminAudit } from '../admin/audit.js';
@@ -79,19 +80,9 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
     const start = Date.now();
     const body = loginSchema.parse(req.body);
 
-    // Per-account (email) failure counter — independent of req.ip so a shared
-    // corporate NAT can't self-lock. `applyLoginBackoff` inserts a growing
-    // delay after each failure to slow bots down without hard-locking real
-    // users. Hard lock only kicks in at LOGIN_HARD_LOCK failures/hour.
-    const failsSoFar = await bumpLoginFailure(body.email);
-    if (failsSoFar > LOGIN_HARD_LOCK) {
-      logger.warn({ email: body.email, ip: req.ip, fails: failsSoFar }, 'login hard-locked');
-      throw new AuthError('locked');
-    }
-    await applyLoginBackoff(failsSoFar - 1);
-
-    // CSRF check on login too (cookie may be absent first time; in that case
-    // the client should hit /csrf before login)
+    // CSRF check first (cookie may be absent first time; in that case the
+    // client should hit /csrf before login). Requests that fail here never
+    // touch the failure counters — they can't be used to lock an account.
     const csrfHeader = req.headers[csrfHeaderName];
     const csrfCookie = req.cookies?.[csrfCookieName];
     if (
@@ -100,8 +91,27 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
       csrfHeader !== csrfCookie ||
       !verifyCsrfToken(csrfHeader)
     ) {
-      throw new AuthError('bad_csrf');
+      throw new AuthError('bad_csrf', 403);
     }
+
+    // Soft counter (per email) drives a progressive delay; the hard lock is
+    // per email + IP so knowing an admin's email is not enough to lock them
+    // out from their own network. See src/admin/rateLimit.ts.
+    const fails = await getLoginFailures(body.email, req.ip);
+    if (fails.hard >= LOGIN_HARD_LOCK) {
+      logger.warn({ email: body.email, ip: req.ip, fails: fails.hard }, 'login hard-locked');
+      throw new AuthError('locked');
+    }
+    await applyLoginBackoff(fails.soft);
+
+    const fail = async (reason: string): Promise<never> => {
+      const counts = await bumpLoginFailure(body.email, req.ip);
+      logger.warn(
+        { email: body.email, ip: req.ip, reason, fails: counts, latencyMs: Date.now() - start },
+        'login failed',
+      );
+      throw new AuthError(reason);
+    };
 
     const [user] = await db
       .select()
@@ -116,15 +126,14 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
       : (await verifyPassword(dummyHash, body.password), false);
 
     if (!user || !passwordOk || user.status !== 'active') {
-      logger.warn({ email: body.email, ip: req.ip, latencyMs: Date.now() - start }, 'login failed');
-      throw new AuthError('bad_credentials');
+      return fail('bad_credentials');
     }
 
     // MFA enforcement
     if (user.totpEnabled) {
       if (body.recoveryCode) {
         const idx = findRecoveryMatch(user.recoveryHashes, body.recoveryCode);
-        if (idx < 0) throw new AuthError('bad_mfa');
+        if (idx < 0) return fail('bad_mfa');
         // Consume the recovery code
         const remaining = user.recoveryHashes.slice();
         remaining.splice(idx, 1);
@@ -140,14 +149,17 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
           { ct: user.totpSecretCt, iv: user.totpSecretIv, tag: user.totpSecretTag },
           `admin_totp:${user.id}`,
         );
-        if (!verifyTotp(secret, body.totpCode)) throw new AuthError('bad_mfa');
+        const step = verifyTotpOnce(secret, body.totpCode, user.totpLastStep ?? null);
+        if (step === null) return fail('bad_mfa');
+        // Persist the accepted step so the same code cannot be replayed.
+        await db.update(adminUsers).set({ totpLastStep: step }).where(eq(adminUsers.id, user.id));
       } else {
         // Tell the client to ask for MFA
         return reply.code(202).send({ needsMfa: true });
       }
     }
 
-    await resetLoginFailures(body.email);
+    await resetLoginFailures(body.email, req.ip);
     await db
       .update(adminUsers)
       .set({ lastLoginAt: new Date() })
@@ -211,22 +223,44 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
       .send({ ok: true });
   });
 
-  app.get(`${prefix}/me`, (req, reply) => {
+  app.get(`${prefix}/me`, async (req, reply) => {
     if (!req.adminUser) return reply.code(401).send({ error: 'unauthenticated' });
+    const [row] = await db
+      .select({ totpEnabled: adminUsers.totpEnabled })
+      .from(adminUsers)
+      .where(eq(adminUsers.id, req.adminUser.id))
+      .limit(1);
     return reply.send({
       id: req.adminUser.id.toString(),
       email: req.adminUser.email,
       role: req.adminUser.role,
       scopedHubId: req.adminUser.scopedHubId?.toString() ?? null,
+      totpEnabled: row?.totpEnabled ?? false,
     });
   });
 }
 
-/** Used by the admin:create CLI. Not wired into an HTTP route. */
+/**
+ * Used by the admin:create CLI. Not wired into an HTTP route.
+ *
+ * Refuses to run once any superadmin exists — bootstrap is a one-shot for
+ * an empty install. Additional admins are invited from the UI (audited,
+ * invite-token flow), never minted from a shell.
+ */
 export async function bootstrapSuperadmin(
   email: string,
   password: string,
 ): Promise<{ id: bigint; email: string }> {
+  const [existing] = await db
+    .select({ id: adminUsers.id })
+    .from(adminUsers)
+    .where(eq(adminUsers.role, 'superadmin'))
+    .limit(1);
+  if (existing) {
+    throw new Error(
+      'a superadmin already exists — invite further admins from the admin UI (Users page)',
+    );
+  }
   const pwHash = await hashPassword(password);
   const [inserted] = await db
     .insert(adminUsers)

@@ -101,17 +101,40 @@ function validatePayload(body) {
   if (body.checkInDate && !/^\d{4}-\d{2}-\d{2}$/.test(body.checkInDate)) {
     errors.push('checkInDate must be YYYY-MM-DD');
   }
-  num('nights', body.nights, { min: 1 });
-  num('adults', body.adults, { min: 0 });
-  if (body.childAges !== undefined && !Array.isArray(body.childAges)) {
-    errors.push('childAges must be an array of numbers');
+  const nights = num('nights', body.nights, { min: 1 });
+  const adults = num('adults', body.adults, { min: 0 });
+  if (nights > 60) errors.push('nights must be <= 60');
+  if (adults > 20) errors.push('adults must be <= 20');
+  // Arrays are typed strictly: an object element would be serialised by the
+  // XML builder as nested elements inside <ChildAge>/<UnitId>.
+  if (
+    body.childAges !== undefined &&
+    (!Array.isArray(body.childAges) ||
+      body.childAges.length > 10 ||
+      !body.childAges.every((n) => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 17))
+  ) {
+    errors.push('childAges must be an array of up to 10 numbers (0-17)');
   }
-  if (body.unitIds !== undefined && !Array.isArray(body.unitIds)) {
-    errors.push('unitIds must be an array of strings');
+  if (
+    body.unitIds !== undefined &&
+    (!Array.isArray(body.unitIds) ||
+      body.unitIds.length > 50 ||
+      !body.unitIds.every((u) => typeof u === 'string' && u.length > 0 && u.length <= 64))
+  ) {
+    errors.push('unitIds must be an array of up to 50 strings');
   }
   if (body.maxResults !== undefined) {
     const m = Number(body.maxResults);
-    if (!Number.isFinite(m) || m < 1) errors.push('maxResults must be a positive number');
+    if (!Number.isFinite(m) || m < 1 || m > 50) errors.push('maxResults must be 1-50');
+  }
+  if (body.expirationDays !== undefined) {
+    const d = Number(body.expirationDays);
+    if (!Number.isFinite(d) || d < 1 || d > 365) errors.push('expirationDays must be 1-365');
+  }
+  for (const k of ['accessCode', 'lang', 'dealId', 'propertyId', 'currency', 'title']) {
+    if (body[k] !== undefined && typeof body[k] === 'string' && body[k].length > 500) {
+      errors.push(`${k} too long`);
+    }
   }
   return errors;
 }
@@ -305,17 +328,20 @@ async function handle(req, res) {
   }
 
   const c = cfg();
-  const missing = assertEnv(c);
-  if (missing.length > 0) {
-    return send(res, 500, { error: 'server_misconfigured', missing });
-  }
 
+  // Auth before anything else — unauthenticated callers learn nothing about
+  // the deployment (not even which env vars are missing).
   if (c.apiToken) {
     const auth = req.headers.authorization || '';
     const supplied = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
     if (!timingSafeTokenEq(supplied, c.apiToken)) {
       return send(res, 401, { error: 'unauthorized' });
     }
+  }
+
+  const missing = assertEnv(c);
+  if (missing.length > 0) {
+    return send(res, 500, { error: 'server_misconfigured', missing });
   }
 
   let raw;
@@ -351,6 +377,16 @@ async function handle(req, res) {
 }
 
 if (require.main === module) {
+  // This service writes to your CRM with a private-app token. Refuse to
+  // start without a bearer token unless explicitly overridden (e.g. behind
+  // your own authenticating proxy / Cloud Run IAM).
+  if (!cfg().apiToken && process.env.ALLOW_UNAUTHENTICATED !== 'true') {
+    // eslint-disable-next-line no-console
+    console.error(
+      'quote-runner: API_TOKEN is not set. Set it, or set ALLOW_UNAUTHENTICATED=true if an upstream proxy authenticates callers.',
+    );
+    process.exit(2);
+  }
   const server = http.createServer((req, res) => {
     handle(req, res).catch((err) => {
       // Last-resort catch — handle() already sends its own errors.

@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ReactElement } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
+import { StreamStatusBadge, useLiveStream } from '../components/LiveStream';
 
 interface TenantsResponse {
   tenants: { hubId: string; name: string; status: string; createdAt: string }[];
@@ -41,8 +42,8 @@ export function Dashboard(): ReactElement {
           value={user?.role === 'superadmin' ? 'Superadmin' : 'Tenant admin'}
         />
         <Stat
-          label="Scope"
-          value={user?.scopedHubId ?? (user?.role === 'superadmin' ? 'All' : '—')}
+          label="MFA"
+          value={user?.totpEnabled ? 'enabled' : 'off — enable in Settings'}
         />
       </div>
 
@@ -52,6 +53,7 @@ export function Dashboard(): ReactElement {
           {tenantsQ.data && tenantsQ.data.tenants.length > 1 && user?.role === 'superadmin' && (
             <select
               className="input max-w-xs"
+              aria-label="Tenant"
               value={activeHubId ?? ''}
               onChange={(e) => setActiveHubId(e.target.value)}
             >
@@ -63,8 +65,16 @@ export function Dashboard(): ReactElement {
             </select>
           )}
         </div>
-        {activeHubId ? <LiveJobs hubId={activeHubId} /> : (
-          <div className="text-slate-500 text-sm">No tenant selected.</div>
+        {tenantsQ.error ? (
+          <div className="text-rose-400 text-sm">Failed to load tenants.</div>
+        ) : activeHubId ? (
+          <LiveJobs hubId={activeHubId} />
+        ) : tenantsQ.isPending ? (
+          <div className="text-slate-500 text-sm">Loading…</div>
+        ) : (
+          <div className="text-slate-500 text-sm">
+            No tenants installed yet. Install the HubSpot app via <code>/oauth/install</code>.
+          </div>
         )}
       </div>
     </div>
@@ -81,34 +91,15 @@ function Stat({ label, value }: { label: string; value: string | number }): Reac
 }
 
 function LiveJobs({ hubId }: { hubId: string }): ReactElement {
-  const [events, setEvents] = useState<LiveJobEvent[]>([]);
-  const esRef = useRef<EventSource | null>(null);
-  const [connected, setConnected] = useState(false);
-
-  useEffect(() => {
-    const es = new EventSource(`/api/admin/live/jobs/${hubId}`, { withCredentials: true });
-    esRef.current = es;
-    es.onopen = () => setConnected(true);
-    es.onerror = () => setConnected(false);
-    es.onmessage = (ev) => {
-      try {
-        const parsed = JSON.parse(ev.data) as LiveJobEvent;
-        setEvents((prev) => [parsed, ...prev].slice(0, 200));
-      } catch {
-        /* ignore */
-      }
-    };
-    return () => es.close();
-  }, [hubId]);
+  const { events, status, reconnect } = useLiveStream<LiveJobEvent>(
+    `/api/admin/live/jobs/${hubId}`,
+    200,
+  );
 
   return (
     <div>
       <div className="text-xs text-slate-500 mb-2">
-        {connected ? (
-          <span className="text-emerald-400">● Connected</span>
-        ) : (
-          <span className="text-amber-400">● Reconnecting…</span>
-        )}
+        <StreamStatusBadge status={status} onReconnect={reconnect} />
         <span className="ml-2">hub_id={hubId}</span>
       </div>
       {events.length === 0 ? (
@@ -118,7 +109,7 @@ function LiveJobs({ hubId }: { hubId: string }): ReactElement {
       ) : (
         <ul className="space-y-1 max-h-96 overflow-auto pr-2 font-mono text-xs">
           {events.map((e, i) => (
-            <li key={i} className="flex gap-3 py-1 border-b border-slate-800/60">
+            <li key={`${e.ts}-${i}`} className="flex gap-3 py-1 border-b border-slate-800/60">
               <span className="text-slate-500 shrink-0">
                 {new Date(e.ts).toLocaleTimeString()}
               </span>

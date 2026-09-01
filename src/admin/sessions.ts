@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { and, eq, gt, lt } from 'drizzle-orm';
+import { and, eq, gt, lt, ne } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { adminSessions, adminUsers } from '../db/schema.js';
 
@@ -88,6 +88,23 @@ export async function touchSession(sid: string): Promise<void> {
 
 export async function revokeSession(sid: string): Promise<void> {
   await db.delete(adminSessions).where(eq(adminSessions.sid, sid));
+}
+
+/**
+ * Ends every other session of a user — called after a password change or an
+ * MFA change so a stolen cookie doesn't survive the credential rotation.
+ */
+export async function revokeOtherSessions(adminUserId: bigint, keepSid: string | undefined): Promise<number> {
+  const where = keepSid
+    ? and(eq(adminSessions.adminUserId, adminUserId), ne(adminSessions.sid, keepSid))
+    : eq(adminSessions.adminUserId, adminUserId);
+  const res = await db.delete(adminSessions).where(where);
+  return Number(res.count ?? 0);
+}
+
+/** Ends all sessions of a user (deactivation). */
+export async function revokeAllSessions(adminUserId: bigint): Promise<number> {
+  return revokeOtherSessions(adminUserId, undefined);
 }
 
 export async function purgeExpiredSessions(): Promise<number> {

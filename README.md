@@ -84,12 +84,42 @@ docker-compose.yml    # local pg + redis
 - Structured logs via pino with redaction allow-list (tokens, signatures, PII).
 - See ARCHITECTURE.md §8 for the full threat model.
 
-## What's NOT yet implemented (next slice)
+## Deploying to DigitalOcean App Platform
 
-- `processDeal` pipeline (`src/queue/jobs/processDeal.ts`)
-- HubDB query, product/line-item/quote/email steps
-- Admin UI + admin API + auth (argon2 + TOTP)
-- Prometheus `/metrics` + alerts
-- Live monitoring SSE streams
-- Phobs probe endpoint
-- `usage_daily` rollup job
+`.do/app.yaml` describes the whole app: a `migrate` PRE_DEPLOY job, the `web`
+service, the `worker`, and managed Postgres + Redis. First deploy:
+
+```bash
+# 1. Create the app from the spec (or paste app.yaml in the DO console)
+doctl apps create --spec .do/app.yaml
+
+# 2. Set the SECRET env vars in the console (both web and worker):
+#    TOKEN_VAULT_KEY, SESSION_SECRET      -> node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+#    HUBSPOT_CLIENT_ID / _SECRET / _APP_ID -> from the HubSpot developer portal
+#    METRICS_TOKEN (optional), ADMIN_IP_ALLOWLIST (recommended, CIDRs)
+#    TOKEN_VAULT_KEY_PREV may stay empty.
+
+# 3. After the first successful deploy, open the web component's Console and
+#    create the initial superadmin (one-shot; refuses if one exists):
+node dist/cli/createAdmin.js
+#    or non-interactively:
+ADMIN_BOOTSTRAP_EMAIL=you@example.com ADMIN_BOOTSTRAP_PASSWORD='…' node dist/cli/createAdmin.js
+
+# 4. Sign in at https://<app>/admin/, enrol TOTP under Settings, then install
+#    the HubSpot app for the first tenant via https://<app>/oauth/install
+```
+
+Migrations run automatically before every deploy (`node dist/cli/migrate.js`,
+drizzle-orm's migrator over `src/db/migrations`). `HUBSPOT_REDIRECT_URI` is
+derived from `${APP_URL}` — register exactly that URL in the HubSpot app.
+
+## Standalone tools
+
+- `standalone/quote-runner/` — single-tenant Node service: POST a booking,
+  get a HubSpot quote back synchronously.
+- `standalone/phobs-mcp/` — MCP server exposing Phobs availability,
+  PCPriceQuoteRQ and HubSpot line-item sync as tools for Claude.
+- `do-functions/phobs-availability/` — DigitalOcean Functions: availability
+  probe and webhook-triggered line-item sync.
+
+Each has its own README.

@@ -20,7 +20,7 @@ export interface PhobsClientOpts {
  */
 const ALLOWED_HOSTS_RE = /(^|\.)phobs\.net$/i;
 
-function assertAllowedEndpoint(endpoint: string): URL {
+export function assertAllowedEndpoint(endpoint: string): URL {
   let url: URL;
   try {
     url = new URL(endpoint);

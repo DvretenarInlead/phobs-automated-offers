@@ -1,3 +1,15 @@
+/**
+ * One-shot superadmin bootstrap.
+ *
+ *   Interactive (TTY, e.g. DO App Platform console):
+ *     node dist/cli/createAdmin.js
+ *
+ *   Non-interactive (CI / one-off job):
+ *     ADMIN_BOOTSTRAP_EMAIL=you@example.com \
+ *     ADMIN_BOOTSTRAP_PASSWORD='…' node dist/cli/createAdmin.js
+ *
+ * Refuses if a superadmin already exists. Invite further admins from the UI.
+ */
 import { createInterface } from 'node:readline/promises';
 import process from 'node:process';
 import { bootstrapSuperadmin } from '../routes/adminAuth.js';
@@ -6,8 +18,7 @@ import { z } from 'zod';
 
 async function prompt(label: string, hidden = false): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  if (hidden) {
-    // Best-effort: disable echo by writing a CSI escape and rely on TTY raw mode.
+  if (hidden && process.stdin.isTTY) {
     process.stdout.write(label);
     process.stdin.setRawMode?.(true);
     let buf = '';
@@ -35,28 +46,45 @@ async function prompt(label: string, hidden = false): Promise<string> {
         }
       });
     });
-  } else {
-    const answer = await rl.question(label);
-    rl.close();
-    return answer;
   }
+  const answer = await rl.question(label);
+  rl.close();
+  return answer;
 }
 
 async function main(): Promise<void> {
   console.error('Phobs Automated Offers — create initial superadmin');
-  const email = z.string().email().toLowerCase().parse((await prompt('Email: ')).trim());
-  const password = passwordSchema.parse(await prompt('Password (hidden): ', true));
-  const password2 = await prompt('Confirm password: ', true);
-  // Two user-entered strings in the same interactive session; timing-attack
-  // surface does not apply.
-  // eslint-disable-next-line security/detect-possible-timing-attacks
-  if (password !== password2) {
-    console.error('Passwords do not match.');
-    process.exit(1);
+
+  const envEmail = process.env.ADMIN_BOOTSTRAP_EMAIL?.trim();
+  const envPassword = process.env.ADMIN_BOOTSTRAP_PASSWORD;
+
+  let email: string;
+  let password: string;
+  if (envEmail && envPassword) {
+    email = z.string().email().toLowerCase().parse(envEmail);
+    password = passwordSchema.parse(envPassword);
+  } else {
+    if (!process.stdin.isTTY) {
+      console.error(
+        'No TTY. Set ADMIN_BOOTSTRAP_EMAIL and ADMIN_BOOTSTRAP_PASSWORD for non-interactive use.',
+      );
+      process.exit(2);
+    }
+    email = z.string().email().toLowerCase().parse((await prompt('Email: ')).trim());
+    password = passwordSchema.parse(await prompt('Password (hidden): ', true));
+    const password2 = await prompt('Confirm password: ', true);
+    // Two user-entered strings in the same interactive session; timing-attack
+    // surface does not apply.
+    // eslint-disable-next-line security/detect-possible-timing-attacks
+    if (password !== password2) {
+      console.error('Passwords do not match.');
+      process.exit(1);
+    }
   }
+
   const created = await bootstrapSuperadmin(email, password);
   console.error(`OK. Superadmin created: id=${created.id.toString()} email=${created.email}`);
-  console.error('Sign in via POST /api/admin/login. Configure TOTP from the admin UI when it ships.');
+  console.error('Sign in at /admin/login, then enrol TOTP under Settings before inviting others.');
   process.exit(0);
 }
 

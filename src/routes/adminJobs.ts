@@ -33,7 +33,10 @@ export function registerAdminJobsRoutes(app: FastifyInstance, prefix = '/api/adm
           : null;
 
     const queue = getQueue();
-    const failed = await queue.getJobs(['failed'], 0, q.limit, false);
+    // The failed set is global; over-fetch so a tenant filter still fills
+    // `limit` rows when other tenants' failures dominate the head of the set.
+    const fetchWindow = targetHubId === null ? q.limit : Math.min(q.limit * 20, 2000);
+    const failed = await queue.getJobs(['failed'], 0, fetchWindow, false);
 
     const items = failed
       .filter((j): j is Job => Boolean(j))
@@ -51,7 +54,8 @@ export function registerAdminJobsRoutes(app: FastifyInstance, prefix = '/api/adm
           source: data?.source ?? null,
         };
       })
-      .filter((j) => (targetHubId === null ? true : j.hubId === targetHubId.toString()));
+      .filter((j) => (targetHubId === null ? true : j.hubId === targetHubId.toString()))
+      .slice(0, q.limit);
 
     return reply.send({ items });
   });
@@ -116,9 +120,10 @@ export function registerAdminJobsRoutes(app: FastifyInstance, prefix = '/api/adm
     },
   );
 
-  // GET /queue/stats — counts of waiting/active/failed/completed
-  app.get(`${prefix}/queue/stats`, { preHandler: requireRole('tenant_admin') }, async (_req, reply) => {
-    const redis = makeRedis();
+  // GET /queue/stats — counts of waiting/active/failed/completed. The queue
+  // is shared across tenants, so the numbers are superadmin-only.
+  app.get(`${prefix}/queue/stats`, { preHandler: requireRole('superadmin', { allowSuperadmin: false }) }, async (_req, reply) => {
+    const redis = makeRedis({ failFast: true });
     try {
       const [waiting, active, failed, completed, delayed] = await Promise.all([
         redis.llen(`bull:${QUEUE_NAME}:wait`),

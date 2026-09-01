@@ -172,9 +172,14 @@ export function resolveOverrides(raw: unknown): Overrides {
  * property names — first non-null/undefined wins. Returns undefined if none
  * are set.
  */
+/** Own-property read — never walks the prototype chain (`constructor`, `__proto__`, …). */
+export function ownProp(obj: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(obj, key) ? obj[key] : undefined;
+}
+
 export function readMapped(payload: Record<string, unknown>, ...names: string[]): unknown {
   for (const n of names) {
-    const v = payload[n];
+    const v = ownProp(payload, n);
     if (v !== undefined && v !== null && v !== '') return v;
   }
   return undefined;
@@ -207,7 +212,7 @@ export function evaluateSkip(
   conditions: SkipCondition[],
 ): { skip: boolean; matched: SkipCondition | null } {
   for (const cond of conditions) {
-    if (matches(payload[cond.property], cond)) {
+    if (matches(ownProp(payload, cond.property), cond)) {
       return { skip: true, matched: cond };
     }
   }
@@ -254,7 +259,7 @@ export function shouldAttachLoyalty(
   payload: Record<string, unknown>,
   rule: LoyaltyRule,
 ): boolean {
-  const v = payload[rule.trigger_property];
+  const v = ownProp(payload, rule.trigger_property);
   switch (rule.trigger_condition) {
     case 'present':
       return v !== undefined && v !== null && v !== '';

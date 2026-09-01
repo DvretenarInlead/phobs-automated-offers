@@ -29,6 +29,13 @@
       "when": 1786269900000,
       "tag": "0003_ip_allowlist",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1788300000000,
+      "tag": "0004_security_hardening",
+      "breakpoints": true
     }
   ]
 }

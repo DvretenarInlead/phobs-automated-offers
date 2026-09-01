@@ -310,15 +310,34 @@ function validate(args, creds) {
   }
   num('nights', 1);
   num('adults', 0);
-  if (args.childAges !== undefined && !Array.isArray(args.childAges)) {
-    errors.push('childAges must be an array of numbers');
+  if (Number(args.nights) > 60) errors.push('nights must be <= 60');
+  if (Number(args.adults) > 20) errors.push('adults must be <= 20');
+  // Arrays are typed strictly: an object element would be serialised by the
+  // XML builder as nested elements inside <ChildAge>/<UnitId>.
+  if (
+    args.childAges !== undefined &&
+    (!Array.isArray(args.childAges) ||
+      args.childAges.length > 10 ||
+      !args.childAges.every((n) => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 17))
+  ) {
+    errors.push('childAges must be an array of up to 10 numbers (0-17)');
   }
-  if (args.unitIds !== undefined && !Array.isArray(args.unitIds)) {
-    errors.push('unitIds must be an array of strings');
+  if (
+    args.unitIds !== undefined &&
+    (!Array.isArray(args.unitIds) ||
+      args.unitIds.length > 50 ||
+      !args.unitIds.every((u) => typeof u === 'string' && u.length > 0 && u.length <= 64))
+  ) {
+    errors.push('unitIds must be an array of up to 50 strings');
   }
   if (args.maxResults !== undefined) {
     const m = Number(args.maxResults);
-    if (!Number.isFinite(m) || m < 1) errors.push('maxResults must be a positive number');
+    if (!Number.isFinite(m) || m < 1 || m > 50) errors.push('maxResults must be 1-50');
+  }
+  for (const k of ['accessCode', 'lang', 'dealId', 'propertyId']) {
+    if (args[k] !== undefined && typeof args[k] === 'string' && args[k].length > 128) {
+      errors.push(`${k} too long`);
+    }
   }
 
   if (!creds.endpoint) errors.push('missing env: PHOBS_ENDPOINT');

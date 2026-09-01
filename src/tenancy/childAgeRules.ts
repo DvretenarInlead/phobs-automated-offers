@@ -36,7 +36,11 @@ export interface NormalizeResult {
 }
 
 export function normalizeChildAges(input: NormalizeInput): NormalizeResult {
-  const rule = input.rules[input.propertyId];
+  // Own-property lookup: a webhook propertyId of "constructor" must not
+  // resolve to Object.prototype.constructor and masquerade as a rule.
+  const rule = Object.hasOwn(input.rules, input.propertyId)
+    ? input.rules[input.propertyId]
+    : undefined;
   if (!rule) {
     return {
       childAges: input.childAges.slice(),

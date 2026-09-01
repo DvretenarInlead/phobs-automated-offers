@@ -50,7 +50,10 @@ async function buildApp() {
     // Platform terminates TLS at 1 hop). `true` here would let any client
     // spoof req.ip via X-Forwarded-For and bypass the admin IP allow-list,
     // login-lockout, and metrics localhost fallback.
-    trustProxy: config.TRUST_PROXY_HOPS,
+    // Fastify 5.12 types no longer accept a hop count directly; this function
+    // is exactly what proxy-addr compiles a numeric count into (trust hop i
+    // iff i < N, hop 0 = the socket peer). N=0 trusts nothing.
+    trustProxy: (_address: string, hop: number): boolean => hop < config.TRUST_PROXY_HOPS,
     bodyLimit: 1_000_000,
     disableRequestLogging: false,
     genReqId: () => randomUUID(),

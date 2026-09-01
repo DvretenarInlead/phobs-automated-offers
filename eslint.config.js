@@ -15,6 +15,10 @@ export default tseslint.config(
       'tailwind.config.js',
       'postcss.config.js',
       'web/**',
+      // Plain-JS standalone tools with their own package.json; not part of
+      // the main tsconfig project service.
+      'standalone/**',
+      'do-functions/**',
     ],
   },
   js.configs.recommended,

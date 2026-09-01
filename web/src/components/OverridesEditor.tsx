@@ -37,6 +37,11 @@ export interface Overrides {
   };
   default_lang: string;
   product_sku_template: string;
+  price_quote: {
+    enabled: boolean;
+    endpoint: string | null;
+    on_failure: 'fallback' | 'fail';
+  };
 }
 
 export interface SkipCondition {
@@ -74,6 +79,9 @@ export function OverridesEditor({ value, onChange }: Props): ReactElement {
     patch('quote_defaults', { ...value.quote_defaults, ...kv });
   const patchLr = (kv: Partial<Overrides['loyalty_rule']>): void =>
     patch('loyalty_rule', { ...value.loyalty_rule, ...kv });
+  const pq = value.price_quote ?? { enabled: false, endpoint: null, on_failure: 'fallback' as const };
+  const patchPq = (kv: Partial<Overrides['price_quote']>): void =>
+    patch('price_quote', { ...pq, ...kv });
 
   return (
     <div className="space-y-8">
@@ -294,6 +302,48 @@ export function OverridesEditor({ value, onChange }: Props): ReactElement {
           value={value.product_sku_template}
           onChange={(e) => patch('product_sku_template', e.target.value)}
         />
+      </div>
+
+      {/* Price quote (PCPriceQuoteRQ) */}
+      <div>
+        <h3 className="font-medium text-sm text-slate-300 mb-1">
+          Firm price quote (<code>PCPriceQuoteRQ</code>)
+        </h3>
+        <p className="text-slate-500 text-xs mb-3">
+          When enabled, every offer that survives the rate filters is re-priced with a
+          PCPriceQuoteRQ call before products, line items and the HubSpot quote are created.
+          Validate the call on the <em>Phobs probe</em> page (mode: price quote) before turning
+          this on for a tenant.
+        </p>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+          <label className="flex items-center gap-2 text-sm pb-2">
+            <input
+              type="checkbox"
+              checked={pq.enabled}
+              onChange={(e) => patchPq({ enabled: e.target.checked })}
+            />
+            Enabled
+          </label>
+          <Field label="Dedicated endpoint (optional, https://…phobs.net)">
+            <input
+              className="input font-mono"
+              maxLength={512}
+              value={pq.endpoint ?? ''}
+              onChange={(e) => patchPq({ endpoint: e.target.value.trim() || null })}
+              placeholder="blank = same as availability endpoint"
+            />
+          </Field>
+          <Field label="On failure">
+            <select
+              className="input"
+              value={pq.on_failure}
+              onChange={(e) => patchPq({ on_failure: e.target.value as 'fallback' | 'fail' })}
+            >
+              <option value="fallback">Fall back to availability price</option>
+              <option value="fail">Fail the job (retry later)</option>
+            </select>
+          </Field>
+        </div>
       </div>
 
       {/* Loyalty rule */}

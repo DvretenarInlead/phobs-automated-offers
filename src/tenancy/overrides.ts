@@ -103,6 +103,44 @@ export const skuTemplateSchema = z
   .max(256)
   .default('{portalId}:{unitId}:{rateId}');
 
+// ---------- price quote (PCPriceQuoteRQ) ------------------------------------
+// Opt-in second Phobs round-trip: after rate filtering, each selected offer is
+// re-priced with a firm PCPriceQuoteRQ before products / line items / the
+// HubSpot quote are created. Off by default so existing tenants keep the
+// availability price until they have validated the call from the probe page.
+
+const PHOBS_HOST_RE = /(^|\.)phobs\.net$/i;
+
+export const priceQuoteSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    /**
+     * Optional dedicated URL for PCPriceQuoteRQ. Null = reuse the tenant's
+     * availability endpoint. Same SSRF allow-list as the main endpoint.
+     */
+    endpoint: z
+      .string()
+      .url()
+      .max(512)
+      .refine(
+        (u) => {
+          try {
+            const url = new URL(u);
+            return url.protocol === 'https:' && PHOBS_HOST_RE.test(url.hostname);
+          } catch {
+            return false;
+          }
+        },
+        { message: 'price_quote.endpoint must be an https://*.phobs.net URL' },
+      )
+      .nullable()
+      .default(null),
+    /** What to do when the quote call fails or returns no price. */
+    on_failure: z.enum(['fallback', 'fail']).default('fallback'),
+  })
+  .default({});
+export type PriceQuoteSettings = z.infer<typeof priceQuoteSchema>;
+
 // ---------- combined overrides ----------------------------------------------
 
 export const overridesSchema = z
@@ -114,6 +152,7 @@ export const overridesSchema = z
     loyalty_rule: loyaltyRuleSchema,
     default_lang: z.string().min(1).max(8).default('en'),
     product_sku_template: skuTemplateSchema,
+    price_quote: priceQuoteSchema,
   })
   .default({});
 export type Overrides = z.infer<typeof overridesSchema>;

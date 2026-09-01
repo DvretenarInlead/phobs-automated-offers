@@ -16,7 +16,7 @@ import { rateFiltersSchema } from '../tenancy/rateFilters.js';
 import { overridesSchema, resolveOverrides } from '../tenancy/overrides.js';
 import { seal } from '../crypto/tokenVault.js';
 import { enqueueProcessDeal } from '../queue/index.js';
-import { fetchAvailability } from '../phobs/client.js';
+import { fetchAvailability, fetchPriceQuote } from '../phobs/client.js';
 import { loadTenantContext } from '../tenancy/config.js';
 import { buildWorkflowActionDefinition } from '../hubspot/workflowActionDefinition.js';
 
@@ -45,13 +45,20 @@ const manualTriggerSchema = z.object({
 
 const probeSchema = z.object({
   hubId: z.string().regex(/^\d+$/),
-  propertyId: z.string(),
+  propertyId: z.string().min(1).max(128),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   nights: z.number().int().positive().max(60),
-  adults: z.number().int().nonnegative(),
-  childAges: z.array(z.number().nonnegative()).default([]),
-  unitIds: z.array(z.string()).default([]),
-  lang: z.string().default('en'),
+  adults: z.number().int().nonnegative().max(20),
+  childAges: z.array(z.number().nonnegative().max(17)).max(10).default([]),
+  unitIds: z.array(z.string().max(64)).max(50).default([]),
+  lang: z.string().min(1).max(8).default('en'),
+  /** availability = PCPropertyAvailabilityRQ (default); price_quote = PCPriceQuoteRQ */
+  mode: z.enum(['availability', 'price_quote']).default('availability'),
+  rateId: z.string().max(64).optional(),
+  unitId: z.string().max(64).optional(),
+  accessCode: z.string().max(64).optional(),
+  /** Return the raw response XML (no credentials in responses). */
+  includeRawXml: z.boolean().default(false),
 });
 
 export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admin'): void {
@@ -283,6 +290,48 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
       return reply.code(403).send({ error: 'cross_tenant_denied' });
     }
     const ctx = await loadTenantContext(BigInt(body.hubId));
+    const auth = {
+      siteId: ctx.phobs.siteId,
+      username: ctx.phobs.username,
+      password: ctx.phobs.password,
+    };
+
+    if (body.mode === 'price_quote') {
+      if (!body.unitId) {
+        return reply.code(400).send({ error: 'unit_id_required_for_price_quote' });
+      }
+      const res = await fetchPriceQuote(
+        { endpoint: ctx.overrides.price_quote.endpoint ?? ctx.phobs.endpoint },
+        {
+          lang: body.lang,
+          propertyId: body.propertyId,
+          rateId: body.rateId ?? '',
+          unitId: body.unitId,
+          date: body.date,
+          nights: body.nights,
+          adults: body.adults,
+          childAges: body.childAges,
+          accessCode: body.accessCode,
+          auth,
+        },
+      );
+      await writeAdminAudit({
+        adminUserId: user.id,
+        action: 'phobs_probe.price_quote',
+        target: `hub_id=${body.hubId} prop=${body.propertyId} unit=${body.unitId} rate=${body.rateId ?? ''}`,
+        ip: req.ip,
+      });
+      return reply.send({
+        mode: 'price_quote',
+        success: res.success,
+        error: res.error,
+        sessionId: res.sessionId,
+        quote: res.quote,
+        rates: res.rates,
+        ...(body.includeRawXml ? { rawXml: res.rawXml } : {}),
+      });
+    }
+
     const res = await fetchAvailability(
       { endpoint: ctx.phobs.endpoint },
       {
@@ -293,11 +342,8 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
         unitIds: body.unitIds,
         adults: body.adults,
         childAges: body.childAges,
-        auth: {
-          siteId: ctx.phobs.siteId,
-          username: ctx.phobs.username,
-          password: ctx.phobs.password,
-        },
+        accessCode: body.accessCode,
+        auth,
       },
     );
     await writeAdminAudit({
@@ -306,11 +352,13 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
       target: `hub_id=${body.hubId} prop=${body.propertyId}`,
       ip: req.ip,
     });
-    // Strip raw XML from the response — large and not very useful in UI.
+    // Raw XML only on request — large and rarely useful in the UI.
     return reply.send({
+      mode: 'availability',
       success: res.success,
       sessionId: res.sessionId,
       rates: res.rates,
+      ...(body.includeRawXml ? { rawXml: res.rawXml } : {}),
     });
   });
 }

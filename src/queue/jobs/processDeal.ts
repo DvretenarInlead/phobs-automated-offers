@@ -19,7 +19,8 @@ import { queryUnitsByPropertyId } from '../../hubspot/hubdb.js';
 import { upsertProductBySku } from '../../hubspot/products.js';
 import { createLineItem } from '../../hubspot/lineItems.js';
 import { createApprovedQuote } from '../../hubspot/quotes.js';
-import { fetchAvailability } from '../../phobs/client.js';
+import { fetchAvailability, fetchPriceQuote } from '../../phobs/client.js';
+import type { PhobsRate, PhobsUnit } from '../../phobs/parseResponse.js';
 import { liveEmit } from '../../lib/liveEmit.js';
 import { jobProcessed, jobStepDuration } from '../../metrics/index.js';
 import type { ProcessDealPayload } from '../index.js';
@@ -202,10 +203,75 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
     return { acknowledged: true, outcome: 'no_availability' };
   }
 
+  // ---- Step 7b: firm re-price via PCPriceQuoteRQ (opt-in) ------------------
+  // Replaces the availability price with a quoted price per offer. On failure
+  // either falls back to the availability price (default) or fails the job,
+  // per overrides.price_quote.on_failure.
+  const offers: { rate: PhobsRate; unit: PhobsUnit }[] = filtered.selected.map((s) => ({
+    rate: s.rate,
+    unit: s.unit,
+  }));
+  if (ov.price_quote.enabled) {
+    const pqEndpoint = ov.price_quote.endpoint ?? tenant.phobs.endpoint;
+    for (let i = 0; i < offers.length; i++) {
+      const offer = offers[i]!;
+      const priced = await runStep(jobId, hubId, dealId, 50 + i, `phobs.price_quote[${i}]`, async () => {
+        const before = {
+          pricePerNight: offer.unit.pricePerNight,
+          stayTotal: offer.unit.stayTotal,
+          currency: offer.unit.currency,
+        };
+        try {
+          const res = await fetchPriceQuote(
+            { endpoint: pqEndpoint },
+            {
+              lang,
+              propertyId,
+              rateId: offer.rate.rateId,
+              unitId: offer.unit.unitId,
+              date: fmtDate(checkInMs),
+              nights,
+              adults: norm.adults,
+              childAges: norm.childAges,
+              accessCode: attachLoyalty ? (tenant.accessCode ?? undefined) : undefined,
+              auth: {
+                siteId: tenant.phobs.siteId,
+                username: tenant.phobs.username,
+                password: tenant.phobs.password,
+              },
+            },
+          );
+          const q = res.quote;
+          const hasPrice = q !== null && (q.pricePerNight > 0 || q.stayTotal > 0);
+          if (!res.success || !hasPrice) {
+            const reason = res.error ?? (q === null ? 'no_quote_in_response' : 'no_price');
+            if (ov.price_quote.on_failure === 'fail') {
+              throw new Error(`price quote failed: ${reason}`);
+            }
+            log.warn({ reason, rateId: offer.rate.rateId, unitId: offer.unit.unitId }, 'price quote unusable — falling back to availability price');
+            return { applied: false, reason, before };
+          }
+          const pricePerNight = q.pricePerNight > 0 ? q.pricePerNight : q.stayTotal / nights;
+          const stayTotal = q.stayTotal > 0 ? q.stayTotal : pricePerNight * nights;
+          const after = { pricePerNight, stayTotal, currency: q.currency || before.currency };
+          return { applied: true, before, after };
+        } catch (err) {
+          if (ov.price_quote.on_failure === 'fail') throw err;
+          const reason = err instanceof Error ? err.message : String(err);
+          log.warn({ reason, rateId: offer.rate.rateId, unitId: offer.unit.unitId }, 'price quote call failed — falling back to availability price');
+          return { applied: false, reason, before };
+        }
+      });
+      if (priced.applied && priced.after) {
+        offer.unit = { ...offer.unit, ...priced.after };
+      }
+    }
+  }
+
   // ---- Step 8: products (find-or-create) -----------------------------------
   const productIds: string[] = [];
-  for (let i = 0; i < filtered.selected.length; i++) {
-    const sel = filtered.selected[i]!;
+  for (let i = 0; i < offers.length; i++) {
+    const sel = offers[i]!;
     const sku = renderTemplate(ov.product_sku_template, {
       portalId: hubIdStr,
       unitId: sel.unit.unitId,
@@ -231,8 +297,8 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
 
   // ---- Step 9: line items --------------------------------------------------
   const lineItemIds: string[] = [];
-  for (let i = 0; i < filtered.selected.length; i++) {
-    const sel = filtered.selected[i]!;
+  for (let i = 0; i < offers.length; i++) {
+    const sel = offers[i]!;
     const productId = productIds[i]!;
     const li = await runStep(
       jobId,
@@ -267,7 +333,7 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
       lineItemIds,
       title: quoteTitle,
       expirationDays: ov.quote_defaults.expiration_days,
-      currency: filtered.selected[0]!.unit.currency || ov.quote_defaults.currency_fallback,
+      currency: offers[0]!.unit.currency || ov.quote_defaults.currency_fallback,
     }),
   );
 

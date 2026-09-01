@@ -39,19 +39,19 @@ const parser = new XMLParser({
   trimValues: true,
 });
 
+export type XmlObj = Record<string, unknown>;
+
 function toArray<T>(v: unknown): T[] {
   if (v === undefined || v === null) return [];
   return (Array.isArray(v) ? v : [v]) as T[];
 }
-
-type XmlObj = Record<string, unknown>;
 
 function num(v: unknown): number {
   const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
   return Number.isFinite(n) ? n : 0;
 }
 
-function str(v: unknown): string {
+export function str(v: unknown): string {
   if (typeof v === 'string') return v;
   if (v == null) return '';
   if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'bigint') return String(v);
@@ -64,18 +64,42 @@ function str(v: unknown): string {
   return '';
 }
 
-export function parseAvailabilityResponse(xml: string): PhobsAvailabilityResponse {
-  // fast-xml-parser returns `any`; isolate the unsafe surface to this single read.
+/** Parses an XML string with the XXE-safe parser. Isolates the `any` surface. */
+export function parseXml(xml: string): XmlObj {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
   const doc: XmlObj = parser.parse(xml);
-  const rootRaw = doc.PCPropertyAvailabilityRS;
-  const root: XmlObj = rootRaw && typeof rootRaw === 'object' ? (rootRaw as XmlObj) : {};
+  return doc;
+}
 
-  const availability = (root.AvailabilityList ?? {}) as XmlObj;
-  const ratePlansContainer = (availability.RatePlans ?? {}) as XmlObj;
+/** `<ResponseType><Success/></ResponseType>` or `<Errors><Error><Message>`. */
+export function parseResponseType(root: XmlObj): { success: boolean; error: string | null } {
+  const responseType = (root.ResponseType ?? {}) as XmlObj;
+  const success = 'Success' in responseType;
+  let error: string | null = null;
+  if ('Errors' in responseType) {
+    const errors = (responseType.Errors ?? {}) as XmlObj;
+    const first = toArray<unknown>(errors.Error)[0];
+    if (first && typeof first === 'object') {
+      const e = first as XmlObj;
+      error = str(e.Message ?? e['#text'] ?? e['@_Message']) || 'phobs_error';
+    } else if (first !== undefined) {
+      error = str(first) || 'phobs_error';
+    } else {
+      error = 'phobs_error';
+    }
+  }
+  return { success, error };
+}
+
+/**
+ * Parses a `<RatePlans><RatePlan>…` container (shared by the availability and
+ * price-quote responses) into typed rates.
+ */
+export function parseRatePlans(container: XmlObj): PhobsRate[] {
+  const ratePlansContainer = (container.RatePlans ?? {}) as XmlObj;
   const ratePlans = toArray<XmlObj>(ratePlansContainer.RatePlan);
 
-  const rates: PhobsRate[] = ratePlans.map((rp): PhobsRate => {
+  return ratePlans.map((rp): PhobsRate => {
     const unitsContainer = (rp.Units ?? {}) as XmlObj;
     const units = toArray<XmlObj>(unitsContainer.Unit);
     const restrictions = (rp.Restrictions ?? {}) as XmlObj;
@@ -125,9 +149,15 @@ export function parseAvailabilityResponse(xml: string): PhobsAvailabilityRespons
       }),
     };
   });
+}
 
-  const responseType = (root.ResponseType ?? {}) as Record<string, unknown>;
-  const success = 'Success' in responseType;
+export function parseAvailabilityResponse(xml: string): PhobsAvailabilityResponse {
+  const doc = parseXml(xml);
+  const rootRaw = doc.PCPropertyAvailabilityRS;
+  const root: XmlObj = rootRaw && typeof rootRaw === 'object' ? (rootRaw as XmlObj) : {};
+
+  const rates = parseRatePlans((root.AvailabilityList ?? {}) as XmlObj);
+  const { success } = parseResponseType(root);
   const sessionId = root.SessionID ? str(root.SessionID) : null;
 
   return { rates, sessionId, success, rawXml: xml };

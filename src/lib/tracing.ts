@@ -32,6 +32,21 @@ if (endpoint) {
     instrumentations: [
       getNodeAutoInstrumentations({
         '@opentelemetry/instrumentation-fs': { enabled: false },
+        // Personal data must not leave for the collector:
+        //  - ioredis' default serializer records ALL args for EVAL*/INCR/DEL,
+        //    i.e. BullMQ's serialised job payloads and `login:fail:<email>`
+        //    counters. Record the command name only.
+        '@opentelemetry/instrumentation-ioredis': {
+          dbStatementSerializer: (cmdName: string) => cmdName,
+        },
+        //  - HTTP server spans keep the query string; OAuth `code`/`state`
+        //    and admin invite `token` travel there.
+        '@opentelemetry/instrumentation-http': {
+          redactedQueryParams: ['code', 'state', 'token', 'sig', 'signature'],
+        },
+        //  - pg: statement text without parameter values (the default; pinned
+        //    here so an upgrade can't flip it).
+        '@opentelemetry/instrumentation-pg': { enhancedDatabaseReporting: false },
       }),
     ],
   });

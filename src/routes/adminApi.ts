@@ -17,7 +17,7 @@ import { overridesSchema, resolveOverrides } from '../tenancy/overrides.js';
 import { seal } from '../crypto/tokenVault.js';
 import { enqueueProcessDeal } from '../queue/index.js';
 import { assertAllowedEndpoint, fetchAvailability, fetchPriceQuote } from '../phobs/client.js';
-import { loadTenantContext } from '../tenancy/config.js';
+import { accessCodeAad, hasAccessCode, loadTenantContext } from '../tenancy/config.js';
 import { buildWorkflowActionDefinition } from '../hubspot/workflowActionDefinition.js';
 
 const hubIdParamSchema = z.object({ hubId: z.string().regex(/^\d+$/) });
@@ -120,8 +120,8 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
         owner_id: cfg.ownerId.toString(),
         // Loyalty access code is a shared secret with Phobs; mask like Phobs
         // creds. UI shows whether it's set via `access_code_set`.
-        access_code: cfg.accessCode ? MASK : null,
-        access_code_set: Boolean(cfg.accessCode),
+        access_code: hasAccessCode(cfg) ? MASK : null,
+        access_code_set: hasAccessCode(cfg),
         property_rules: cfg.propertyRules,
         rate_filters: cfg.rateFilters,
         trigger_mode: cfg.triggerMode,
@@ -180,7 +180,18 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
       if (body.quote_template_id !== undefined) updates.quoteTemplateId = body.quote_template_id;
       if (body.owner_id !== undefined) updates.ownerId = BigInt(body.owner_id);
       if (body.access_code !== undefined && body.access_code !== MASK) {
-        updates.accessCode = body.access_code === '' ? null : body.access_code;
+        // Always vaulted; the legacy plaintext column is cleared on every write.
+        updates.accessCode = null;
+        if (body.access_code === null || body.access_code === '') {
+          updates.accessCodeCt = null;
+          updates.accessCodeIv = null;
+          updates.accessCodeTag = null;
+        } else {
+          const s = seal(body.access_code, accessCodeAad(hubId));
+          updates.accessCodeCt = s.ct;
+          updates.accessCodeIv = s.iv;
+          updates.accessCodeTag = s.tag;
+        }
       }
       if (body.property_rules !== undefined) updates.propertyRules = body.property_rules;
       if (body.rate_filters !== undefined) updates.rateFilters = body.rate_filters;
@@ -396,11 +407,14 @@ function redactConfig(cfg: typeof tenantConfig.$inferSelect): Record<string, unk
     phobsAuthPassCt: _p1,
     phobsAuthPassIv: _p2,
     phobsAuthPassTag: _p3,
-    accessCode,
+    accessCode: _ac,
+    accessCodeCt: _ac1,
+    accessCodeIv: _ac2,
+    accessCodeTag: _ac3,
     ...safe
   } = cfg;
   return {
-    accessCodeSet: Boolean(accessCode),
+    accessCodeSet: hasAccessCode(cfg),
     ...safe,
     hubId: safe.hubId.toString(),
     ownerId: safe.ownerId.toString(),

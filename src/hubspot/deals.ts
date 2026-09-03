@@ -1,6 +1,6 @@
 import type { Client as HubSpotClient } from '@hubspot/api-client';
 import { callWithRetry } from '../lib/retry.js';
-import { ExternalServiceError } from '../lib/errors.js';
+import { hubspotError } from './errors.js';
 
 export async function updateDeal(
   hs: HubSpotClient,
@@ -11,8 +11,7 @@ export async function updateDeal(
     try {
       await hs.crm.deals.basicApi.update(dealId.toString(), { properties });
     } catch (err) {
-      const status = extractStatus(err);
-      throw new ExternalServiceError('hubspot', `deal.update failed: ${String(err)}`, status, err);
+      throw hubspotError('deal.update', err);
     }
   });
 }
@@ -27,16 +26,7 @@ export async function fetchDeal(
       const res = await hs.crm.deals.basicApi.getById(dealId.toString(), propertyNames);
       return res.properties;
     } catch (err) {
-      const status = extractStatus(err);
-      throw new ExternalServiceError('hubspot', `deal.get failed: ${String(err)}`, status, err);
+      throw hubspotError('deal.get', err);
     }
   });
-}
-
-function extractStatus(err: unknown): number | undefined {
-  if (typeof err === 'object' && err !== null) {
-    const e = err as { code?: number; response?: { status?: number } };
-    return e.code ?? e.response?.status;
-  }
-  return undefined;
 }

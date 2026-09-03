@@ -361,9 +361,13 @@ function timingSafeEq(a, b) {
 async function main(args) {
   const started = Date.now();
 
-  // Optional bearer gate — set API_TOKEN in env to require it.
+  // Bearer gate — mandatory. This action writes to the CRM with a private-app
+  // token, so it must never be reachable unauthenticated.
   const apiToken = process.env.API_TOKEN || '';
-  if (apiToken) {
+  if (!apiToken) {
+    return { statusCode: 500, body: { error: 'server_misconfigured', message: 'API_TOKEN not set' } };
+  }
+  {
     const headers = args.__ow_headers || {};
     const auth = headers.authorization || '';
     const supplied = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';

@@ -38,6 +38,19 @@ async function buildApp() {
   const app = Fastify({
     logger: {
       level: config.LOG_LEVEL,
+      // Fastify's default req serializer logs the full URL including the
+      // query string — which is where OAuth `code`/`state` and admin invite
+      // `token` values travel. Log the path only. Headers and bodies are
+      // never logged (the default serializer omits them; the redact list is
+      // belt-and-braces for any custom log call that includes req.headers).
+      serializers: {
+        req: (req: { method?: string; url?: string; ip?: string; id?: unknown }) => ({
+          id: req.id,
+          method: req.method,
+          path: (req.url ?? '').split('?')[0],
+          remoteAddress: req.ip,
+        }),
+      },
       redact: {
         paths: [
           'req.headers.authorization',

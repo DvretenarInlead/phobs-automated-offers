@@ -1,7 +1,7 @@
 import type { Client as HubSpotClient } from '@hubspot/api-client';
 import { AssociationSpecAssociationCategoryEnum } from '@hubspot/api-client/lib/codegen/crm/line_items/index.js';
 import { callWithRetry } from '../lib/retry.js';
-import { ExternalServiceError } from '../lib/errors.js';
+import { hubspotError } from './errors.js';
 
 const HUBSPOT_DEFINED = AssociationSpecAssociationCategoryEnum.HubspotDefined;
 const ASSOC_LINE_ITEM_TO_PRODUCT = 20;
@@ -60,21 +60,7 @@ export async function createLineItem(
       });
       return { id: created.id };
     } catch (err) {
-      const status = extractStatus(err);
-      throw new ExternalServiceError(
-        'hubspot',
-        `lineItem.create failed: ${String(err)}`,
-        status,
-        err,
-      );
+      throw hubspotError('lineItem.create', err);
     }
   });
-}
-
-function extractStatus(err: unknown): number | undefined {
-  if (typeof err === 'object' && err !== null) {
-    const e = err as { code?: number; response?: { status?: number } };
-    return e.code ?? e.response?.status;
-  }
-  return undefined;
 }

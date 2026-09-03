@@ -47,8 +47,19 @@ async function refreshTokens(hubId: bigint, refreshToken: string): Promise<Token
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
   });
   if (res.statusCode >= 400) {
-    const body = await res.body.text();
-    throw new ExternalServiceError('hubspot', `refresh failed: ${body}`, res.statusCode);
+    // Keep only HubSpot's error category; never persist the raw body.
+    let category = 'unknown';
+    try {
+      const body = (await res.body.json()) as { category?: string; status?: string };
+      category = body.category ?? body.status ?? 'unknown';
+    } catch {
+      /* non-JSON body */
+    }
+    throw new ExternalServiceError(
+      'hubspot',
+      `token refresh failed: HTTP ${res.statusCode}: ${category}`,
+      res.statusCode,
+    );
   }
   const payload = (await res.body.json()) as {
     access_token: string;
@@ -78,16 +89,39 @@ async function refreshTokens(hubId: bigint, refreshToken: string): Promise<Token
   return { accessToken: payload.access_token, refreshToken: payload.refresh_token, expiresAt };
 }
 
-export async function getAccessToken(hubId: bigint): Promise<string> {
+export async function getAccessToken(hubId: bigint, opts: { force?: boolean } = {}): Promise<string> {
   const tokens = await loadTokens(hubId);
-  if (tokens.expiresAt.getTime() - Date.now() <= REFRESH_LEAD_MS) {
+  if (opts.force || tokens.expiresAt.getTime() - Date.now() <= REFRESH_LEAD_MS) {
     const refreshed = await refreshTokens(hubId, tokens.refreshToken);
     return refreshed.accessToken;
   }
   return tokens.accessToken;
 }
 
-export async function getHubSpotClient(hubId: bigint): Promise<HubSpotClient> {
-  const accessToken = await getAccessToken(hubId);
+export async function getHubSpotClient(
+  hubId: bigint,
+  opts: { forceRefresh?: boolean } = {},
+): Promise<HubSpotClient> {
+  const accessToken = await getAccessToken(hubId, { force: opts.forceRefresh });
   return new HubSpotClient({ accessToken });
+}
+
+/**
+ * Runs `fn` with a client; if HubSpot answers 401 (token revoked or expired
+ * early, before our stored expiry says so) the token is refreshed once and
+ * `fn` is retried with a fresh client. Any other failure propagates.
+ */
+export async function withHubSpotClient<T>(
+  hubId: bigint,
+  fn: (hs: HubSpotClient) => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn(await getHubSpotClient(hubId));
+  } catch (err) {
+    if (err instanceof ExternalServiceError && err.upstreamStatus === 401) {
+      logger.warn({ hubId: hubId.toString() }, 'hubspot 401 — forcing token refresh and retrying once');
+      return fn(await getHubSpotClient(hubId, { forceRefresh: true }));
+    }
+    throw err;
+  }
 }

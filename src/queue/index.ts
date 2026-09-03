@@ -43,12 +43,15 @@ export function getQueue(): Queue {
 }
 
 export const defaultJobOpts: JobsOptions = {
-  attempts: 8,
+  // 4 job-level attempts × up to 4 in-call retries (src/lib/retry.ts) already
+  // covers a multi-minute upstream outage; permanent failures short-circuit
+  // via UnrecoverableError in the worker.
+  attempts: 4,
   backoff: { type: 'exponential', delay: 5000 },
   removeOnComplete: { age: 86_400, count: 1000 },
-  // Keep the dead-letter set inspectable from the admin UI, but not forever:
-  // raw webhook payloads live in job data.
-  removeOnFail: { age: 30 * 86_400, count: 5000 },
+  // Keep the dead-letter set inspectable from the admin UI, but not for long:
+  // raw webhook payloads (guest booking details) live in job data.
+  removeOnFail: { age: config.RETENTION_FAILED_JOBS_DAYS * 86_400, count: 5000 },
 };
 
 export interface ProcessDealPayload {
@@ -66,7 +69,8 @@ export interface ProcessDealPayload {
     products?: Record<string, string>;
     /** `${productId}:${unitId}:${rateId}` → HubSpot line item id */
     lineItems?: Record<string, string>;
-    quote?: { id: string; link: string | null };
+    /** Reused on retry only when built from the same line items (lineItemKey). */
+    quote?: { id: string; link: string | null; lineItemKey: string };
   };
 }
 

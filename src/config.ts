@@ -19,7 +19,12 @@ const emptyToUndefined = (v: unknown): unknown => (typeof v === 'string' && v.tr
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(8080),
-  PUBLIC_BASE_URL: z.string().url(),
+  // Trailing slash stripped: it is concatenated with req.url to rebuild the
+  // exact URI HubSpot signed, and "//webhooks/…" would fail every signature.
+  PUBLIC_BASE_URL: z
+    .string()
+    .url()
+    .transform((u) => u.replace(/\/+$/, '')),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 
   // AES-256-GCM requires exactly 32 bytes.
@@ -45,6 +50,15 @@ const envSchema = z.object({
   REDIS_URL: z.string().url(),
 
   ADMIN_IP_ALLOWLIST: z.string().optional().default(''),
+
+  // Data retention (days). Enforced daily by the maintenance job. Per-deal
+  // operational records (job steps, audit log) hold guest booking details
+  // (child ages, dates) and default to 90 days; admin accountability records
+  // default to 2 years. Set per your DPA.
+  RETENTION_JOB_STEPS_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
+  RETENTION_AUDIT_LOG_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
+  RETENTION_ADMIN_AUDIT_DAYS: z.coerce.number().int().min(30).max(3650).default(730),
+  RETENTION_FAILED_JOBS_DAYS: z.coerce.number().int().min(1).max(90).default(7),
 
   // How many trusted proxies terminate in front of the app. Default 0 =
   // trust nothing (req.ip is the socket peer). DO App Platform puts exactly

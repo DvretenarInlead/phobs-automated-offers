@@ -65,7 +65,15 @@ export const tenantConfig = pgTable('tenant_config', {
   hubdbColumnMap: jsonb('hubdb_column_map').notNull().default(sql`'{}'::jsonb`),
   quoteTemplateId: text('quote_template_id').notNull(),
   ownerId: bigint('owner_id', { mode: 'bigint' }).notNull(),
+  /**
+   * Loyalty access code (shared secret with Phobs). Vaulted like the Phobs
+   * credentials; the legacy plaintext `access_code` column is read as a
+   * fallback and cleared by the maintenance job once re-sealed.
+   */
   accessCode: text('access_code'),
+  accessCodeCt: bytea('access_code_ct'),
+  accessCodeIv: bytea('access_code_iv'),
+  accessCodeTag: bytea('access_code_tag'),
   propertyRules: jsonb('property_rules').notNull().default(sql`'{}'::jsonb`),
   rateFilters: jsonb('rate_filters').notNull().default(sql`'{}'::jsonb`),
   triggerMode: text('trigger_mode').notNull().default('webhook'),

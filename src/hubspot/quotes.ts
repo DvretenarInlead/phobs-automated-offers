@@ -2,7 +2,7 @@ import type { Client as HubSpotClient } from '@hubspot/api-client';
 import { AssociationSpecAssociationCategoryEnum } from '@hubspot/api-client/lib/codegen/crm/quotes/index.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { callWithRetry } from '../lib/retry.js';
-import { ExternalServiceError } from '../lib/errors.js';
+import { hubspotError } from './errors.js';
 
 const HUBSPOT_DEFINED = AssociationSpecAssociationCategoryEnum.HubspotDefined;
 const ASSOC_QUOTE_TO_TEMPLATE = 286;
@@ -72,13 +72,7 @@ export async function createApprovedQuote(
       });
       return res.id;
     } catch (err) {
-      const status = extractStatus(err);
-      throw new ExternalServiceError(
-        'hubspot',
-        `quote.create failed: ${String(err)}`,
-        status,
-        err,
-      );
+      throw hubspotError('quote.create', err);
     }
   });
 
@@ -88,13 +82,7 @@ export async function createApprovedQuote(
         properties: { hs_status: 'APPROVED' },
       });
     } catch (err) {
-      const status = extractStatus(err);
-      throw new ExternalServiceError(
-        'hubspot',
-        `quote.approve failed: ${String(err)}`,
-        status,
-        err,
-      );
+      throw hubspotError('quote.approve', err);
     }
   });
 
@@ -105,9 +93,15 @@ export async function createApprovedQuote(
 /**
  * After APPROVED, HubSpot needs a moment to materialise `hs_quote_link`.
  * Poll up to ~10s with 1s spacing — replaces the legacy `setTimeout(6000)`.
+ * Exported so a resumed job whose earlier attempt timed out here can try
+ * again instead of leaving the deal without a link.
  */
-async function pollQuoteLink(hs: HubSpotClient, quoteId: string): Promise<string | null> {
-  const deadline = Date.now() + 10_000;
+export async function pollQuoteLink(
+  hs: HubSpotClient,
+  quoteId: string,
+  timeoutMs = 10_000,
+): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const q = await hs.crm.quotes.basicApi.getById(quoteId, ['hs_quote_link']);
@@ -119,12 +113,4 @@ async function pollQuoteLink(hs: HubSpotClient, quoteId: string): Promise<string
     await delay(1000);
   }
   return null;
-}
-
-function extractStatus(err: unknown): number | undefined {
-  if (typeof err === 'object' && err !== null) {
-    const e = err as { code?: number; response?: { status?: number } };
-    return e.code ?? e.response?.status;
-  }
-  return undefined;
 }

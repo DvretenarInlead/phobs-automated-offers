@@ -82,6 +82,42 @@ against your real HubSpot portal, Phobs account and DigitalOcean project.
    - Build the Docker image in CI once (`docker build .`) — this sandbox had
      no Docker daemon, so the Dockerfile was reviewed but not executed here.
 
+## 1b. Data protection (guest personal data)
+
+The pipeline handles booking details of EU guests (dates, party size, child
+ages, loyalty ids; anything else the tenant's workflow chooses to send).
+What the system does with them after the data-protection audit:
+
+- **Retention is enforced daily** by the worker's maintenance job. Defaults:
+  `job_steps` and `audit_log` 90 days, `admin_audit` / `tenant_config_history`
+  2 years, failed queue jobs (raw payload in Redis) 7 days, completed jobs
+  24 h. Override with `RETENTION_*_DAYS` per your DPA.
+- **What is stored per deal**: deal id, normalised party (adults, child ages),
+  rate/unit ids and prices, HubSpot object ids, error categories. Never: raw
+  Phobs XML, Phobs booking URLs, HubDB rows, HubSpot error bodies/headers,
+  the public quote link, credentials.
+- **Erasure**: `node dist/cli/eraseDeal.js --hub <hubId> --deal <dealId>
+  [--dry-run]` removes every record for a deal (Postgres + queue). Resolve a
+  contact to their deal ids in HubSpot first — nothing here is keyed by
+  guest identity. Platform logs and database backups age out on the
+  provider's schedule; note that in your record of processing.
+- **Logs** never contain request bodies, headers or query strings (OAuth
+  codes and invite tokens travel in the query string). Failed admin logins
+  log the admin email + IP at `warn` — staff data, list it in the RoPA.
+- **Tracing** (`OTEL_EXPORTER_OTLP_ENDPOINT`) is off by default. If enabled,
+  the ioredis/http instrumentations are configured not to export job
+  payloads or query strings; keep the collector in the EU.
+- **Vault** covers OAuth tokens, Phobs credentials, TOTP secrets and (from
+  migration 0005) the loyalty access code.
+- **Subprocessors**: DigitalOcean (hosting, EU region), Phobs (availability
+  and pricing; receives stay dates, party size, child ages), HubSpot (CRM;
+  receives everything written back to the deal).
+- **Verify on first deploy**: `REDIS_URL` should be `rediss://` (TLS); DO's
+  Redis certificate must chain to the system store or boot fails closed.
+  Turn on Postgres backups/PITR in the DO console and note their retention.
+  Send only the listed deal properties from the HubSpot workflow — the
+  webhook accepts extra fields but every extra field is more data to hold.
+
 ## 2. Fixed in this pass
 
 Build / deploy blockers
@@ -159,6 +195,26 @@ Admin UI (from the QA pass)
   states; job retry/discard show errors; self-deactivate hidden; duplicate
   invite → clear message; rules-of-hooks violation removed; numeric guards on
   probe inputs; rate-filter limit seeds are saveable.
+
+Data protection (from the second audit)
+- Retention job for `job_steps`, `audit_log`, `admin_audit`,
+  `tenant_config_history`; failed-job payloads in Redis 7 days (was 30).
+- Request log serializer logs the path only (invite tokens / OAuth codes were
+  in the query string).
+- HubSpot SDK errors reduced to status + category + short message before
+  they reach `job_steps.error`, `failedReason`, SSE or the UI.
+- Public quote links, Phobs booking URLs, per-day price breakdowns and full
+  HubDB rows no longer persisted; migration 0005 scrubs existing rows.
+- Loyalty access code vaulted (migration 0005 + maintenance re-seal).
+- OTel instrumentation configured not to export Redis command arguments or
+  HTTP query strings.
+- `eraseDeal` CLI + `job_steps.deal_id` index.
+- Correctness: HubSpot 401 now forces a token refresh and retries instead of
+  dead-lettering; malformed input is a `ValidationError` (no retries); a
+  resumed job re-polls a missing quote link and only reuses a quote built
+  from the same line items; job attempts 8 → 4; TOTP step update is atomic;
+  `PUBLIC_BASE_URL` trailing slash tolerated; `sync-line-items` DO function
+  requires `API_TOKEN`.
 
 ## 3. Known gaps (deliberately left)
 

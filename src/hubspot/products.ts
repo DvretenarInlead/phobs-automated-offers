@@ -1,7 +1,7 @@
 import type { Client as HubSpotClient } from '@hubspot/api-client';
 import { FilterOperatorEnum } from '@hubspot/api-client/lib/codegen/crm/products/index.js';
 import { callWithRetry } from '../lib/retry.js';
-import { ExternalServiceError } from '../lib/errors.js';
+import { hubspotError } from './errors.js';
 
 export interface ProductRef {
   id: string;
@@ -41,13 +41,7 @@ export async function upsertProductBySku(
       });
       return { id: created.id, sku: input.sku };
     } catch (err) {
-      const status = extractStatus(err);
-      throw new ExternalServiceError(
-        'hubspot',
-        `product.create failed: ${String(err)}`,
-        status,
-        err,
-      );
+      throw hubspotError('product.create', err);
     }
   });
 }
@@ -69,21 +63,7 @@ async function findBySku(hs: HubSpotClient, sku: string): Promise<ProductRef | n
       const first = res.results[0];
       return first ? { id: first.id, sku } : null;
     } catch (err) {
-      const status = extractStatus(err);
-      throw new ExternalServiceError(
-        'hubspot',
-        `product.search failed: ${String(err)}`,
-        status,
-        err,
-      );
+      throw hubspotError('product.search', err);
     }
   });
-}
-
-function extractStatus(err: unknown): number | undefined {
-  if (typeof err === 'object' && err !== null) {
-    const e = err as { code?: number; response?: { status?: number } };
-    return e.code ?? e.response?.status;
-  }
-  return undefined;
 }

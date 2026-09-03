@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { eq } from 'drizzle-orm';
+import { and, eq, isNull, lt, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { adminUsers } from '../db/schema.js';
 import { logger } from '../lib/logger.js';
@@ -151,8 +151,20 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
         );
         const step = verifyTotpOnce(secret, body.totpCode, user.totpLastStep ?? null);
         if (step === null) return fail('bad_mfa');
-        // Persist the accepted step so the same code cannot be replayed.
-        await db.update(adminUsers).set({ totpLastStep: step }).where(eq(adminUsers.id, user.id));
+        // Persist the accepted step atomically: the conditional UPDATE makes
+        // two concurrent logins with the same code race for one row — the
+        // loser sees no row and is rejected, so a code is never used twice.
+        const claimed = await db
+          .update(adminUsers)
+          .set({ totpLastStep: step })
+          .where(
+            and(
+              eq(adminUsers.id, user.id),
+              or(isNull(adminUsers.totpLastStep), lt(adminUsers.totpLastStep, step)),
+            ),
+          )
+          .returning({ id: adminUsers.id });
+        if (claimed.length === 0) return fail('bad_mfa');
       } else {
         // Tell the client to ask for MFA
         return reply.code(202).send({ needsMfa: true });

@@ -13,15 +13,16 @@ import {
   renderTemplate,
   shouldAttachLoyalty,
 } from '../../tenancy/overrides.js';
-import { getHubSpotClient } from '../../hubspot/client.js';
+import { withHubSpotClient } from '../../hubspot/client.js';
 import { updateDeal } from '../../hubspot/deals.js';
 import { queryUnitsByPropertyId } from '../../hubspot/hubdb.js';
 import { upsertProductBySku } from '../../hubspot/products.js';
 import { createLineItem } from '../../hubspot/lineItems.js';
-import { createApprovedQuote } from '../../hubspot/quotes.js';
+import { createApprovedQuote, pollQuoteLink } from '../../hubspot/quotes.js';
 import { fetchAvailability, fetchPriceQuote } from '../../phobs/client.js';
 import type { PhobsRate, PhobsUnit } from '../../phobs/parseResponse.js';
 import { liveEmit } from '../../lib/liveEmit.js';
+import { ExternalServiceError, ValidationError } from '../../lib/errors.js';
 import { jobProcessed, jobStepDuration } from '../../metrics/index.js';
 import type { ProcessDealPayload } from '../index.js';
 
@@ -49,7 +50,13 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
   const hubId = BigInt(hubIdStr);
   const jobId = job.id ?? 'no-id';
 
-  const parsed = payloadSchema.parse(job.data.rawPayload);
+  // Malformed input is permanent — surface it as a ValidationError so the
+  // worker dead-letters immediately instead of retrying.
+  const parsedResult = payloadSchema.safeParse(job.data.rawPayload);
+  if (!parsedResult.success) {
+    throw new ValidationError('processDeal: payload is not an object or array of objects');
+  }
+  const parsed = parsedResult.data;
   const item = Array.isArray(parsed) ? parsed[0]! : parsed;
 
   // ---- Step 1: load tenant context (contains resolved overrides) ------------
@@ -95,12 +102,14 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
 
   const dealIdRaw = readMapped(item, ifm.deal_id);
   if (dealIdRaw === undefined) {
-    throw new Error(`processDeal: missing input field '${ifm.deal_id}' (deal_id)`);
+    throw new ValidationError(`processDeal: missing input field '${ifm.deal_id}' (deal_id)`);
   }
-  const dealId =
-    typeof dealIdRaw === 'bigint'
-      ? dealIdRaw
-      : BigInt(safeStr(dealIdRaw) || '0');
+  let dealId: bigint;
+  try {
+    dealId = typeof dealIdRaw === 'bigint' ? dealIdRaw : BigInt(safeStr(dealIdRaw) || '0');
+  } catch {
+    throw new ValidationError(`processDeal: input field '${ifm.deal_id}' is not a numeric deal id`);
+  }
   const log = logger.child({ jobId, hubId: hubIdStr, dealId: dealId.toString(), requestId });
   log.info('processDeal start');
 
@@ -136,7 +145,9 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
 
   const adultsInput = coerceInt(readMapped(item, ifm.adults, ifm.fallback_adults), 0);
   const propertyId = safeStr(readMapped(item, ifm.property_id));
-  if (!propertyId) throw new Error(`processDeal: missing '${ifm.property_id}' (property_id)`);
+  if (!propertyId) {
+    throw new ValidationError(`processDeal: missing '${ifm.property_id}' (property_id)`);
+  }
 
   const norm = normalizeChildAges({
     childAges,
@@ -166,16 +177,29 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
   dealProps[ofm.adults] = norm.adults.toString();
   dealProps[ofm.num_children] = norm.numberOfChildren.toString();
 
-  // ---- Step 4: HubSpot client + write normalized deal ----------------------
-  const hs = await getHubSpotClient(hubId);
+  // ---- Step 4: write normalized deal ---------------------------------------
+  // Every HubSpot call goes through withHubSpotClient: a 401 (token revoked
+  // or expired early) forces one token refresh and retries the call, instead
+  // of dead-lettering the job until the stored expiry passes.
   await runStep(jobId, hubId, dealId, 4, 'deal.update.normalized', async () => {
-    await updateDeal(hs, dealId, dealProps);
+    await withHubSpotClient(hubId, (hs) => updateDeal(hs, dealId, dealProps));
     return { properties: dealProps };
   });
 
   // ---- Step 5: HubDB unit lookup -------------------------------------------
-  const units = await runStep(jobId, hubId, dealId, 5, 'hubdb.query', () =>
-    queryUnitsByPropertyId(hs, tenant.hubdbTableId, tenant.hubdbColumnMap, propertyId),
+  const units = await runStep(
+    jobId,
+    hubId,
+    dealId,
+    5,
+    'hubdb.query',
+    () =>
+      withHubSpotClient(hubId, (hs) =>
+        queryUnitsByPropertyId(hs, tenant.hubdbTableId, tenant.hubdbColumnMap, propertyId),
+      ),
+    // Unit ids only — the full HubDB rows are tenant data we don't need to
+    // copy into every job record.
+    (rows) => ({ count: rows.length, units: rows.map((r) => ({ unitId: r.unitId, propertyId: r.propertyId })) }),
   );
 
   // ---- Step 6: Phobs availability ------------------------------------------
@@ -210,9 +234,28 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
           },
         },
       ),
-    // Persist the parsed result, never the raw XML (large, and would grow
-    // job_steps without bound).
-    (r) => ({ success: r.success, sessionId: r.sessionId, rateCount: r.rates.length, rates: r.rates }),
+    // Persist a compact summary: never the raw XML, and no per-unit bookUrl
+    // (Phobs booking URLs may carry the session id / access code) or the
+    // per-day price breakdown.
+    (r) => ({
+      success: r.success,
+      sessionId: r.sessionId,
+      rateCount: r.rates.length,
+      rates: r.rates.map((rate) => ({
+        rateId: rate.rateId,
+        name: rate.name,
+        stayMinNights: rate.stayMinNights,
+        units: rate.units.map((u) => ({
+          unitId: u.unitId,
+          name: u.name,
+          availableUnits: u.availableUnits,
+          board: u.board,
+          pricePerNight: u.pricePerNight,
+          stayTotal: u.stayTotal,
+          currency: u.currency,
+        })),
+      })),
+    }),
   );
 
   // ---- Step 7: apply rate filters ------------------------------------------
@@ -239,7 +282,9 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
   if (filtered.selected.length === 0) {
     log.info('no availability after filtering — marking deal silently');
     await runStep(jobId, hubId, dealId, 8, 'deal.no_availability', async () => {
-      await updateDeal(hs, dealId, { [ofm.availability_status]: 'no_availability' });
+      await withHubSpotClient(hubId, (hs) =>
+        updateDeal(hs, dealId, { [ofm.availability_status]: 'no_availability' }),
+      );
       return { status: 'no_availability' };
     });
     return { acknowledged: true, outcome: 'no_availability' };
@@ -288,7 +333,8 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
           if (!res.success || !hasPrice) {
             const reason = res.error ?? (q === null ? 'no_quote_in_response' : 'no_price');
             if (ov.price_quote.on_failure === 'fail') {
-              throw new Error(`price quote failed: ${reason}`);
+              // Upstream condition → retryable (no status = treated as transient).
+              throw new ExternalServiceError('phobs', `price quote failed: ${reason}`);
             }
             log.warn({ reason, rateId: offer.rate.rateId, unitId: offer.unit.unitId }, 'price quote unusable — falling back to availability price');
             return { applied: false, reason, before };
@@ -328,13 +374,15 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
       async () => {
         const known = createdProducts[sku];
         if (known) return { id: known, sku, resumed: true };
-        const p = await upsertProductBySku(hs, {
-          sku,
-          name: `${sel.unit.name} — ${sel.rate.name}`,
-          description: sel.rate.shortDescription,
-          price: sel.unit.pricePerNight,
-          currency: sel.unit.currency || ov.quote_defaults.currency_fallback,
-        });
+        const p = await withHubSpotClient(hubId, (hs) =>
+          upsertProductBySku(hs, {
+            sku,
+            name: `${sel.unit.name} — ${sel.rate.name}`,
+            description: sel.rate.shortDescription,
+            price: sel.unit.pricePerNight,
+            currency: sel.unit.currency || ov.quote_defaults.currency_fallback,
+          }),
+        );
         createdProducts[sku] = p.id;
         await saveProgress();
         return { ...p, resumed: false };
@@ -358,15 +406,17 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
       async () => {
         const known = createdLineItems[liKey];
         if (known) return { id: known, resumed: true };
-        const created = await createLineItem(hs, {
-          productId,
-          dealId,
-          name: `${sel.unit.name} — ${sel.rate.name}`,
-          quantity: nights,
-          price: sel.unit.pricePerNight,
-          currency: sel.unit.currency || ov.quote_defaults.currency_fallback,
-          description: sel.rate.shortDescription,
-        });
+        const created = await withHubSpotClient(hubId, (hs) =>
+          createLineItem(hs, {
+            productId,
+            dealId,
+            name: `${sel.unit.name} — ${sel.rate.name}`,
+            quantity: nights,
+            price: sel.unit.pricePerNight,
+            currency: sel.unit.currency || ov.quote_defaults.currency_fallback,
+            description: sel.rate.shortDescription,
+          }),
+        );
         createdLineItems[liKey] = created.id;
         await saveProgress();
         return { ...created, resumed: false };
@@ -380,35 +430,69 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
     dealId: dealId.toString(),
     portalId: hubIdStr,
   });
-  const quote = await runStep(jobId, hubId, dealId, 200, 'quote.create_approve_fetch', async () => {
-    const known = job.data.progress?.quote;
-    if (known) return { ...known, resumed: true };
-    const q = await createApprovedQuote(hs, {
-      dealId,
-      quoteTemplateId: tenant.quoteTemplateId,
-      ownerId: tenant.ownerId,
-      lineItemIds,
-      title: quoteTitle,
-      expirationDays: ov.quote_defaults.expiration_days,
-      currency: offers[0]!.unit.currency || ov.quote_defaults.currency_fallback,
-    });
-    await job.updateData({
-      ...job.data,
-      progress: { ...job.data.progress, products: createdProducts, lineItems: createdLineItems, quote: q },
-    });
-    return { ...q, resumed: false };
-  });
+  const lineItemKey = [...lineItemIds].sort().join(',');
+  const quote = await runStep(
+    jobId,
+    hubId,
+    dealId,
+    200,
+    'quote.create_approve_fetch',
+    async () => {
+      // Resume only if the earlier attempt's quote was built from exactly
+      // this line-item set; if availability changed between attempts a new
+      // quote is created so the offer and its line items always agree.
+      const known = job.data.progress?.quote;
+      if (known && known.lineItemKey === lineItemKey) {
+        // The earlier attempt may have timed out waiting for hs_quote_link.
+        const link =
+          known.link ?? (await withHubSpotClient(hubId, (hs) => pollQuoteLink(hs, known.id)));
+        return { id: known.id, link, resumed: true };
+      }
+      const q = await withHubSpotClient(hubId, (hs) =>
+        createApprovedQuote(hs, {
+          dealId,
+          quoteTemplateId: tenant.quoteTemplateId,
+          ownerId: tenant.ownerId,
+          lineItemIds,
+          title: quoteTitle,
+          expirationDays: ov.quote_defaults.expiration_days,
+          currency: offers[0]!.unit.currency || ov.quote_defaults.currency_fallback,
+        }),
+      );
+      await job.updateData({
+        ...job.data,
+        progress: {
+          ...job.data.progress,
+          products: createdProducts,
+          lineItems: createdLineItems,
+          quote: { id: q.id, link: q.link, lineItemKey },
+        },
+      });
+      return { ...q, resumed: false };
+    },
+    // The quote link is a public, unauthenticated URL to the guest's offer —
+    // it lives in HubSpot, never in our records.
+    (q) => ({ id: q.id, hasLink: q.link !== null, resumed: q.resumed }),
+  );
 
   // ---- Step 11: write quote link back to deal ------------------------------
-  await runStep(jobId, hubId, dealId, 201, 'deal.update.quote_link', async () => {
-    const props: Record<string, string> = {
-      [ofm.quote_id]: quote.id,
-      [ofm.availability_status]: 'available',
-    };
-    if (quote.link) props[ofm.quote_link] = quote.link;
-    await updateDeal(hs, dealId, props);
-    return props;
-  });
+  await runStep(
+    jobId,
+    hubId,
+    dealId,
+    201,
+    'deal.update.quote_link',
+    async () => {
+      const props: Record<string, string> = {
+        [ofm.quote_id]: quote.id,
+        [ofm.availability_status]: 'available',
+      };
+      if (quote.link) props[ofm.quote_link] = quote.link;
+      await withHubSpotClient(hubId, (hs) => updateDeal(hs, dealId, props));
+      return props;
+    },
+    (props) => ({ ...props, ...(ofm.quote_link in props ? { [ofm.quote_link]: '[set]' } : {}) }),
+  );
 
   await writeAudit({
     hubId,
@@ -418,7 +502,7 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
     status: 'ok',
     response: {
       quoteId: quote.id,
-      quoteLink: quote.link,
+      quoteLinkSet: quote.link !== null,
       lineItems: lineItemIds.length,
       products: productIds.length,
     },
@@ -426,7 +510,7 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
 
   jobProcessed.labels('ok').inc();
   log.info({ quoteId: quote.id }, 'processDeal complete');
-  return { acknowledged: true, quoteId: quote.id, quoteLink: quote.link };
+  return { acknowledged: true, quoteId: quote.id, quoteLinkSet: quote.link !== null };
 }
 
 /**

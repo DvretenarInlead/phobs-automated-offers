@@ -1,6 +1,7 @@
 import type { Client as HubSpotClient } from '@hubspot/api-client';
 import { callWithRetry } from '../lib/retry.js';
 import { ExternalServiceError } from '../lib/errors.js';
+import { hubspotError } from './errors.js';
 import type { HubdbColumnMap } from '../tenancy/config.js';
 
 export interface HubDbUnitRow {
@@ -62,12 +63,7 @@ export async function queryUnitsByPropertyId(
       }
       return matches;
     } catch (err) {
-      const status =
-        typeof err === 'object' && err !== null
-          ? ((err as { code?: number }).code ??
-            (err as { response?: { status?: number } }).response?.status)
-          : undefined;
-      throw new ExternalServiceError('hubspot', `hubdb.query failed: ${String(err)}`, status, err);
+      throw hubspotError('hubdb.query', err);
     }
   });
 }

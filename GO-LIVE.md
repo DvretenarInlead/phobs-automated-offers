@@ -45,10 +45,14 @@ against your real HubSpot portal, Phobs account and DigitalOcean project.
 
 3. **First tenant**
    - `https://<app>/oauth/install` from the HubSpot portal's admin user.
-   - Admin → Tenants → Configure: Phobs endpoint (must be `https://*.phobs.net`),
-     Site ID, username, password, HubDB table ID + column names, quote
-     template ID, owner ID, loyalty access code (optional), property rules,
-     rate filters.
+   - Admin → Tenants → Configure. The page opens in "Set up tenant" mode:
+     Phobs endpoint (must be `https://*.phobs.net`), Site ID, username,
+     password, HubDB table ID + column names, quote template ID, owner ID,
+     loyalty access code (optional). *Create configuration* stores it and
+     shows the **webhook URL once** — it carries a per-tenant token
+     (`/webhooks/hubspot/<portalId>/<token>`). Copy it straight into the
+     HubSpot workflow. It can be rotated later from the same page.
+   - Then property rules, rate filters, pipeline overrides.
    - Optionally invite a `tenant_admin` (Users page → invite link).
 
 4. **Phobs live verification** (admin → Phobs probe)
@@ -62,14 +66,20 @@ against your real HubSpot portal, Phobs account and DigitalOcean project.
      *Firm price quote* under Pipeline overrides for the tenant.
 
 5. **HubSpot webhook live verification**
-   - Create the workflow ("Send a webhook", POST
-     `https://<app>/webhooks/hubspot/<portalId>`, include the deal properties
-     above) and fire it for a test deal.
+   - Create the workflow ("Send a webhook", POST to the tenant's webhook URL
+     from step 3 — it includes the per-tenant token — request signature from
+     this app, include the deal properties above) and fire it for a test deal.
    - Watch admin → Live (webhooks) and Jobs. If the webhook is rejected with
      `signature_failed`, the log line carries the reason
-     (`bad_signature` / `stale_timestamp`). The v3 base string was corrected
-     to HubSpot's documented `method + uri + body + timestamp` order in this
-     pass; a real delivery is the confirmation.
+     (`bad_signature` / `stale_timestamp` / `bad_token`). The v3 base string
+     was corrected to HubSpot's documented `method + uri + body + timestamp`
+     order in this pass; a real delivery is the confirmation.
+   - Why the token: HubSpot signs with the public app's client secret, which
+     is the same for every portal the app is installed on. The signature
+     alone proves the request came from HubSpot, not from *this* tenant's
+     portal. The token in the signed URL provides that binding, and the
+     pipeline additionally verifies the deal exists in the tenant's portal
+     (with the tenant's own OAuth token) before writing anything.
    - Check the deal: line items, quote (APPROVED) with link, properties
      written back.
 

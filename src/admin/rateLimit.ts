@@ -1,12 +1,21 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { makeRedis } from '../queue/index.js';
+import { makeRedis, waitForReady } from '../queue/index.js';
 import type { Redis } from 'ioredis';
 
-let r: Redis | null = null;
-function redis(): Redis {
-  // Request-path client: fail fast on a Redis outage rather than hang logins.
-  if (!r) r = makeRedis({ failFast: true });
-  return r;
+// One shared fail-fast client for all request-path counters. Fail-fast
+// clients have no offline queue, so a command issued before the socket is
+// ready is rejected — callers therefore always go through `redis()`, which
+// waits for the first `ready` (bounded) before handing the client out.
+let client: Redis | null = null;
+let readyPromise: Promise<void> | null = null;
+
+async function redis(): Promise<Redis> {
+  if (!client) {
+    client = makeRedis({ failFast: true });
+    readyPromise = waitForReady(client, 5_000).catch(() => undefined);
+  }
+  await readyPromise;
+  return client;
 }
 
 // Login throttling, two layers:
@@ -34,7 +43,8 @@ function hardKey(email: string, ip: string): string {
 }
 
 async function bump(k: string, windowSec: number): Promise<number> {
-  const tx = redis().multi();
+  const r = await redis();
+  const tx = r.multi();
   tx.incr(k);
   tx.expire(k, windowSec, 'NX');
   const results = await tx.exec();
@@ -43,7 +53,7 @@ async function bump(k: string, windowSec: number): Promise<number> {
 }
 
 async function get(k: string): Promise<number> {
-  const v = await redis().get(k);
+  const v = await (await redis()).get(k);
   return v ? Number(v) : 0;
 }
 
@@ -70,8 +80,9 @@ export async function bumpLoginFailure(
 
 /** Clears the soft counter after a successful login (hard counters for other IPs stay). */
 export async function resetLoginFailures(email: string, ip?: string): Promise<void> {
-  await redis().del(softKey(email));
-  if (ip) await redis().del(hardKey(email, ip));
+  const r = await redis();
+  await r.del(softKey(email));
+  if (ip) await r.del(hardKey(email, ip));
 }
 
 /**
@@ -79,15 +90,16 @@ export async function resetLoginFailures(email: string, ip?: string): Promise<vo
  * the account regardless of IP.
  */
 export async function unlockAccount(email: string): Promise<number> {
+  const r = await redis();
   const pattern = `login:hardfail:${email.toLowerCase()}:*`;
   let cursor = '0';
   let removed = 0;
   do {
-    const [next, keys] = await redis().scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+    const [next, keys] = await r.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
     cursor = next;
-    if (keys.length > 0) removed += await redis().del(...keys);
+    if (keys.length > 0) removed += await r.del(...keys);
   } while (cursor !== '0');
-  removed += await redis().del(softKey(email));
+  removed += await r.del(softKey(email));
   return removed;
 }
 
@@ -118,25 +130,36 @@ const SSE_TTL_SEC = 60 * 60;
  * SSE_CAP_PER_USER connections. Callers must invoke `releaseSseSlot` on
  * disconnect regardless of the accept outcome (release is a no-op if the
  * slot was never claimed).
+ *
+ * The TTL is refreshed on every acquire (not NX) so a user with streams
+ * open for over an hour does not see the counter expire underneath them;
+ * it exists only to garbage-collect counters after a crashed process.
  */
 export async function acquireSseSlot(adminUserId: bigint): Promise<{ ok: boolean; count: number }> {
+  const r = await redis();
   const k = `sse:cap:${adminUserId.toString()}`;
-  const tx = redis().multi();
+  const tx = r.multi();
   tx.incr(k);
-  tx.expire(k, SSE_TTL_SEC, 'NX');
+  tx.expire(k, SSE_TTL_SEC);
   const results = await tx.exec();
   const rawFirst = results?.[0]?.[1];
   const count = typeof rawFirst === 'number' ? rawFirst : Number(rawFirst ?? 0);
   if (count > SSE_CAP_PER_USER) {
-    await redis().decr(k).catch(() => undefined);
+    await r.decr(k).catch(() => undefined);
     return { ok: false, count: count - 1 };
   }
   return { ok: true, count };
 }
 
 export async function releaseSseSlot(adminUserId: bigint): Promise<void> {
+  const r = await redis();
   const k = `sse:cap:${adminUserId.toString()}`;
   // Never let the counter go negative — clean up if we hit 0.
-  const remaining = await redis().decr(k).catch(() => 0);
-  if (remaining <= 0) await redis().del(k).catch(() => undefined);
+  const remaining = await r.decr(k).catch(() => 0);
+  if (remaining <= 0) await r.del(k).catch(() => undefined);
+}
+
+/** Shared fail-fast client for health checks (never a per-request client). */
+export async function sharedFailFastRedis(): Promise<Redis> {
+  return redis();
 }

@@ -5,42 +5,57 @@ import { compileAllowlist } from '../lib/ipAllowlist.js';
 import type { CompiledAllowlist } from '../lib/ipAllowlist.js';
 
 /**
- * Loads and caches the webhook IP allow-list for a tenant. Cache TTL is
- * short (30s) so admin changes in the UI propagate quickly without waiting
- * for a full deploy or restart. Cache miss = one small SELECT.
- *
- * `null` result means "no tenant config row" (which we treat as no
- * restriction; the signature/JWT check has already established the caller
- * is legitimate HubSpot for that hub_id).
+ * Per-tenant webhook guard data — IP allow-list and the URL-token hash —
+ * loaded together and cached briefly so the hot webhook path costs one
+ * small SELECT per tenant per 30 s. Admin changes call
+ * `invalidateWebhookAllowlist` so they apply immediately on this instance
+ * (and within the TTL on any other instance).
  */
 
+export interface WebhookGuard {
+  /** Empty = no IP restriction. */
+  allowlist: CompiledAllowlist;
+  /** null = no config row / no token issued yet → every delivery is refused. */
+  tokenHash: string | null;
+}
+
 interface CacheEntry {
-  compiled: CompiledAllowlist;
+  guard: WebhookGuard;
   expiresAt: number;
 }
 
 const CACHE_TTL_MS = 30_000;
 const cache = new Map<string, CacheEntry>();
 
-export async function loadWebhookAllowlist(hubId: bigint): Promise<CompiledAllowlist> {
+export async function loadWebhookGuard(hubId: bigint): Promise<WebhookGuard> {
   const key = hubId.toString();
   const now = Date.now();
   const cached = cache.get(key);
-  if (cached && cached.expiresAt > now) return cached.compiled;
+  if (cached && cached.expiresAt > now) return cached.guard;
 
   const [row] = await db
-    .select({ webhookIpAllowlistCidrs: tenantConfig.webhookIpAllowlistCidrs })
+    .select({
+      webhookIpAllowlistCidrs: tenantConfig.webhookIpAllowlistCidrs,
+      webhookTokenHash: tenantConfig.webhookTokenHash,
+    })
     .from(tenantConfig)
     .where(eq(tenantConfig.hubId, hubId))
     .limit(1);
 
   const cidrs = (row?.webhookIpAllowlistCidrs as string[] | null) ?? [];
-  const compiled = compileAllowlist(cidrs);
-  cache.set(key, { compiled, expiresAt: now + CACHE_TTL_MS });
-  return compiled;
+  const guard: WebhookGuard = {
+    allowlist: compileAllowlist(cidrs),
+    tokenHash: row?.webhookTokenHash ?? null,
+  };
+  cache.set(key, { guard, expiresAt: now + CACHE_TTL_MS });
+  return guard;
 }
 
-/** Test helper — evicts a tenant so the next call re-reads from DB. */
+export async function loadWebhookAllowlist(hubId: bigint): Promise<CompiledAllowlist> {
+  return (await loadWebhookGuard(hubId)).allowlist;
+}
+
+/** Evicts a tenant so the next call re-reads from DB. */
 export function invalidateWebhookAllowlist(hubId: bigint): void {
   cache.delete(hubId.toString());
 }

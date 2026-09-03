@@ -97,6 +97,16 @@ function validate(args, creds) {
   }
   if (args.nights !== undefined && args.nights > 60) errors.push('nights must be <= 60');
   if (args.adults !== undefined && args.adults > 20) errors.push('adults must be <= 20');
+  // Scalars must be strings: an object here would be serialised by the XML
+  // builder as nested elements (tag-name injection into the request).
+  for (const k of ['propertyId', 'checkInDate', 'lang', 'accessCode']) {
+    if (args[k] !== undefined && (typeof args[k] !== 'string' || args[k].length > 128)) {
+      errors.push(`${k} must be a string of at most 128 characters`);
+    }
+  }
+  if (args.includeRestricted !== undefined && typeof args.includeRestricted !== 'boolean') {
+    errors.push('includeRestricted must be a boolean');
+  }
   if (creds.endpoint) {
     try {
       const u = new URL(creds.endpoint);

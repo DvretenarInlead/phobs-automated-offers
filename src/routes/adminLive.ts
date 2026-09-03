@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { makeRedis } from '../queue/index.js';
+import { makeRedis, waitForReady } from '../queue/index.js';
 import { requireRole } from '../admin/auth.js';
 import { liveChannelKey } from '../lib/liveEmit.js';
 import type { LiveChannel } from '../lib/liveEmit.js';
@@ -86,18 +86,34 @@ async function streamSse(
     if (!raw.writableEnded) raw.write(`: keepalive ${Date.now().toString()}\n\n`);
   }, 25_000);
 
-  // Subscribe to the Redis channel; we get a dedicated subscriber per
-  // connection (cheap, lazy-connected). BullMQ shares its own connections.
-  const sub = makeRedis();
+  // Dedicated subscriber per connection. Register cleanup BEFORE anything
+  // that can block (subscribe), so a client that disconnects while we are
+  // still connecting to Redis — or a Redis that never answers — cannot leak
+  // the interval, the client or the per-user slot.
+  const sub = makeRedis({ failFast: true });
+  let cleaned = false;
+  const cleanup = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    clearInterval(ka);
+    sub.removeAllListeners('message');
+    void sub.unsubscribe(channelKey).catch(() => undefined);
+    sub.disconnect();
+  };
+  req.raw.once('close', cleanup);
+  req.raw.once('end', cleanup);
+  raw.once('close', cleanup);
+
   try {
+    await waitForReady(sub, 5_000);
     await sub.subscribe(channelKey);
   } catch (err) {
     logger.warn({ err, channelKey }, 'SSE subscribe failed');
-    clearInterval(ka);
-    sub.disconnect();
-    raw.end();
+    cleanup();
+    if (!raw.writableEnded) raw.end();
     return;
   }
+  if (cleaned) return; // client went away while we were connecting
 
   const onMessage = (_chan: string, payload: string): void => {
     if (raw.writableEnded) return;
@@ -122,19 +138,9 @@ async function streamSse(
   // initial hello so the client knows the stream is live
   raw.write(`event: hello\ndata: ${JSON.stringify({ channel: channelKey, ts: Date.now() })}\n\n`);
 
-  const cleanup = (): void => {
-    clearInterval(ka);
-    sub.off('message', onMessage);
-    void sub.unsubscribe(channelKey).catch(() => undefined);
-    sub.disconnect();
-  };
-
-  req.raw.once('close', cleanup);
-  req.raw.once('end', cleanup);
-  raw.once('close', cleanup);
-
   // Hold the request open until the client disconnects.
   await new Promise<void>((resolve) => {
+    if (cleaned) return resolve();
     raw.once('close', () => resolve());
   });
 }

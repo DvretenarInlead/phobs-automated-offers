@@ -334,10 +334,15 @@ function validate(args, creds) {
     const m = Number(args.maxResults);
     if (!Number.isFinite(m) || m < 1 || m > 50) errors.push('maxResults must be 1-50');
   }
-  for (const k of ['accessCode', 'lang', 'dealId', 'propertyId']) {
-    if (args[k] !== undefined && typeof args[k] === 'string' && args[k].length > 128) {
-      errors.push(`${k} too long`);
+  // Scalars must be strings: an object here would be serialised by the XML
+  // builder as nested elements (tag-name injection into the request).
+  for (const k of ['accessCode', 'lang', 'dealId', 'propertyId', 'checkInDate']) {
+    if (args[k] !== undefined && (typeof args[k] !== 'string' || args[k].length > 128)) {
+      errors.push(`${k} must be a string of at most 128 characters`);
     }
+  }
+  if (args.includeRestricted !== undefined && typeof args.includeRestricted !== 'boolean') {
+    errors.push('includeRestricted must be a boolean');
   }
 
   if (!creds.endpoint) errors.push('missing env: PHOBS_ENDPOINT');

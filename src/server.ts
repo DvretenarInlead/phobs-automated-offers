@@ -27,7 +27,7 @@ import { registerAdminApiTokenRoutes } from './routes/adminApiTokens.js';
 import { registerApiTriggerRoutes } from './routes/apiTrigger.js';
 import { registerAdminAuthHook } from './admin/auth.js';
 import { registerMetricsRoute, httpRequestDuration, httpRequestsTotal } from './metrics/index.js';
-import { makeRedis } from './queue/index.js';
+import { makeRedis, waitForReady } from './queue/index.js';
 import { AppError } from './lib/errors.js';
 import { ZodError } from 'zod';
 
@@ -88,11 +88,13 @@ async function buildApp() {
       return reply.code(err.statusCode).send({ error: err.code, message: err.message });
     }
     if (err instanceof ZodError) {
-      // Field paths + zod's own messages only (never the offending values) so
-      // the admin UI can point at the field instead of a bare "invalid".
+      // Field paths + a fixed description per issue code. Zod's own messages
+      // for enum/literal mismatches echo the submitted value ("received
+      // '<script>'"); those are rewritten so no untrusted input is reflected
+      // into responses or logs.
       const issues = err.issues.slice(0, 20).map((i) => ({
         path: i.path.join('.'),
-        message: i.message,
+        message: safeIssueMessage(i),
       }));
       return reply
         .code(400)
@@ -170,11 +172,15 @@ async function buildApp() {
     crossOriginResourcePolicy: { policy: 'same-origin' },
   });
 
+  // Fail fast when Redis is unreachable: limited routes answer 5xx at once
+  // instead of hanging on an offline queue. Deliberately fail-closed. The
+  // client has no offline queue, so wait for it to be ready before the first
+  // request can reach a limited route (boot fails if Redis is down).
+  const rateLimitRedis = makeRedis({ failFast: true });
+  await waitForReady(rateLimitRedis, 10_000);
   await app.register(rateLimit, {
     global: false,
-    // Fail fast when Redis is unreachable: limited routes answer 5xx at once
-    // instead of hanging on an offline queue. Deliberately fail-closed.
-    redis: makeRedis({ failFast: true }),
+    redis: rateLimitRedis,
     nameSpace: 'rl:',
   });
 
@@ -235,6 +241,26 @@ async function buildApp() {
   }
 
   return app;
+}
+
+function safeIssueMessage(i: ZodError['issues'][number]): string {
+  switch (i.code) {
+    case 'invalid_enum_value':
+      return `must be one of: ${i.options.map(String).join(', ')}`;
+    case 'invalid_literal':
+      return 'unexpected value';
+    case 'unrecognized_keys':
+      return 'unexpected field';
+    case 'invalid_union':
+      return 'invalid value';
+    case 'custom':
+      // Our own refine() messages are fixed strings.
+      return i.message;
+    default:
+      // Type/size/format messages ("Required", "Invalid url", "String must
+      // contain at most 64 character(s)") do not embed the input.
+      return i.message;
+  }
 }
 
 async function start(): Promise<void> {

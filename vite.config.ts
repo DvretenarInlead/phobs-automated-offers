@@ -11,7 +11,9 @@ export default defineConfig({
     // emptyOutDir would delete the server's auth/session modules.
     outDir: fileURLToPath(new URL('./dist/admin-ui', import.meta.url)),
     emptyOutDir: true,
-    sourcemap: true,
+    // No source maps in the served bundle (they would be public under
+    // /admin/assets/*.map). Build with VITE_SOURCEMAP=1 locally to debug.
+    sourcemap: process.env.VITE_SOURCEMAP === '1',
   },
   server: {
     port: 5173,

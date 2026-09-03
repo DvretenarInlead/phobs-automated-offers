@@ -85,6 +85,9 @@ export const tenantConfig = pgTable('tenant_config', {
   /** IP allow-list (array of CIDR strings) for the webhook + workflow-extension
    *  routes for this tenant. Empty array = no restriction. HMAC/JWT auth still
    *  applies; this is defence-in-depth. */
+  /** SHA-256 of the per-tenant webhook URL token (see src/lib/webhookToken.ts). */
+  webhookTokenHash: text('webhook_token_hash'),
+  webhookTokenCreatedAt: timestamp('webhook_token_created_at', { withTimezone: true }),
   webhookIpAllowlistCidrs: jsonb('webhook_ip_allowlist_cidrs')
     .notNull()
     .default(sql`'[]'::jsonb`),

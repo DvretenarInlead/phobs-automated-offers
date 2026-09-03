@@ -13,10 +13,12 @@
  * identity. Resolve the contact to their deal id(s) in HubSpot first.
  */
 import process from 'node:process';
+import type { Job } from 'bullmq';
 import { and, eq, like } from 'drizzle-orm';
 import { db, pg } from '../db/client.js';
 import { auditLog, idempotencyKeys, jobSteps } from '../db/schema.js';
 import { getQueue } from '../queue/index.js';
+import type { ProcessDealPayload } from '../queue/index.js';
 import { writeAdminAudit } from '../admin/audit.js';
 
 function arg(name: string): string | undefined {
@@ -58,24 +60,39 @@ async function main(): Promise<void> {
   }
 
   // Redis / BullMQ: jobs in every state whose id embeds hub+deal, plus any
-  // job for this hub whose raw payload mentions the deal id (manual triggers
-  // have random ids).
+  // job for this hub whose payload's deal id equals the target exactly
+  // (manual triggers have random ids). Paginated so nothing is skipped.
   const queue = getQueue();
-  const jobs = await queue.getJobs(['completed', 'failed', 'delayed', 'waiting', 'active', 'paused'], 0, 5000, false);
-  for (const job of jobs) {
-    if (!job) continue;
-    const data = job.data as { hubId?: string; rawPayload?: unknown } | undefined;
-    const idMatch = typeof job.id === 'string' && job.id.includes(idFragment);
-    const payloadMatch =
-      data?.hubId === hubRaw && JSON.stringify(data.rawPayload ?? null).includes(dealRaw);
-    if (!idMatch && !payloadMatch) continue;
-    counts.queueJobs++;
-    if (!dryRun) {
-      try {
-        await job.remove();
-      } catch (err) {
-        console.error(`could not remove job ${String(job.id)}:`, err instanceof Error ? err.message : err);
+  const PAGE = 500;
+  const states = ['completed', 'failed', 'delayed', 'waiting', 'active', 'paused'] as const;
+  const payloadDealId = (raw: unknown): string | null => {
+    const item = Array.isArray(raw) ? raw[0] : raw;
+    if (!item || typeof item !== 'object') return null;
+    const v = (item as Record<string, unknown>).hs_object_id;
+    return typeof v === 'number' || typeof v === 'string' || typeof v === 'bigint' ? String(v) : null;
+  };
+  for (const state of states) {
+    for (let start = 0; ; start += PAGE) {
+      // BullMQ's Queue is Queue<any> here; pin the job type for the loop.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const jobs: Job<ProcessDealPayload>[] = await queue.getJobs([state], start, start + PAGE - 1, false);
+      if (jobs.length === 0) break;
+      for (const job of jobs) {
+        if (!job) continue;
+        const data = job.data as { hubId?: string; rawPayload?: unknown } | undefined;
+        const idMatch = typeof job.id === 'string' && job.id.includes(idFragment);
+        const payloadMatch = data?.hubId === hubRaw && payloadDealId(data.rawPayload) === dealRaw;
+        if (!idMatch && !payloadMatch) continue;
+        counts.queueJobs++;
+        if (!dryRun) {
+          try {
+            await job.remove();
+          } catch (err) {
+            console.error(`could not remove job ${String(job.id)}:`, err instanceof Error ? err.message : err);
+          }
+        }
       }
+      if (jobs.length < PAGE) break;
     }
   }
 

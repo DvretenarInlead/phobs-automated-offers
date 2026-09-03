@@ -14,7 +14,7 @@ import {
   shouldAttachLoyalty,
 } from '../../tenancy/overrides.js';
 import { withHubSpotClient } from '../../hubspot/client.js';
-import { updateDeal } from '../../hubspot/deals.js';
+import { fetchDeal, updateDeal } from '../../hubspot/deals.js';
 import { queryUnitsByPropertyId } from '../../hubspot/hubdb.js';
 import { upsertProductBySku } from '../../hubspot/products.js';
 import { createLineItem } from '../../hubspot/lineItems.js';
@@ -176,6 +176,30 @@ export async function processDealJob(job: Job<ProcessDealPayload>): Promise<unkn
   }
   dealProps[ofm.adults] = norm.adults.toString();
   dealProps[ofm.num_children] = norm.numberOfChildren.toString();
+
+  // ---- Step 3b: the deal must exist in THIS tenant's portal ---------------
+  // The webhook body is caller-supplied. Before writing anything, fetch the
+  // deal with the tenant's own token: a deal id from another portal (or a
+  // guessed one) fails here as a validation error, and the property id the
+  // CRM holds must agree with the one in the body.
+  await runStep(jobId, hubId, dealId, 3, 'deal.verify', async () => {
+    let props: Record<string, string | null>;
+    try {
+      props = await withHubSpotClient(hubId, (hs) => fetchDeal(hs, dealId, [ifm.property_id]));
+    } catch (err) {
+      if (err instanceof ExternalServiceError && err.upstreamStatus === 404) {
+        throw new ValidationError(`deal ${dealId.toString()} not found in portal ${hubIdStr}`);
+      }
+      throw err;
+    }
+    const crmPropertyId = props[ifm.property_id];
+    if (crmPropertyId && crmPropertyId !== propertyId) {
+      throw new ValidationError(
+        `payload '${ifm.property_id}' does not match the deal's value in HubSpot`,
+      );
+    }
+    return { exists: true, propertyIdChecked: Boolean(crmPropertyId) };
+  });
 
   // ---- Step 4: write normalized deal ---------------------------------------
   // Every HubSpot call goes through withHubSpotClient: a 401 (token revoked

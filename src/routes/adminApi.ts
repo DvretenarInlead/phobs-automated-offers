@@ -18,9 +18,24 @@ import { seal } from '../crypto/tokenVault.js';
 import { enqueueProcessDeal } from '../queue/index.js';
 import { assertAllowedEndpoint, fetchAvailability, fetchPriceQuote } from '../phobs/client.js';
 import { accessCodeAad, hasAccessCode, loadTenantContext } from '../tenancy/config.js';
+import { invalidateWebhookAllowlist } from '../tenancy/webhookAllowlist.js';
+import { generateWebhookToken, webhookPath } from '../lib/webhookToken.js';
+import { loadConfig } from '../config.js';
 import { buildWorkflowActionDefinition } from '../hubspot/workflowActionDefinition.js';
 
+const config = loadConfig();
 const hubIdParamSchema = z.object({ hubId: z.string().regex(/^\d+$/) });
+
+// Admin routes that reach Phobs or the queue get their own per-user limits:
+// an authenticated tenant_admin must not be able to flood Redis with 1 MB
+// dead-letter payloads or use the app as a Phobs egress proxy.
+const ADMIN_HEAVY_RL = {
+  max: 30,
+  timeWindow: '1 minute',
+  keyGenerator: (req: { adminUser?: { id: bigint }; ip: string }): string =>
+    `admin-heavy:${req.adminUser?.id.toString() ?? req.ip}`,
+};
+const ADMIN_HEAVY_BODY_LIMIT = 64 * 1024;
 
 // Value the GET handler returns in place of secrets. A PUT carrying it back
 // means "unchanged" and is ignored (never stored) — protects against a UI
@@ -48,9 +63,16 @@ const updateConfigSchema = z.object({
   overrides: overridesSchema.optional(),
 });
 
+// Same shape the webhook route accepts: one deal object or a non-empty array
+// of them, with bounded keys. Anything else is rejected here rather than
+// becoming a dead-letter job.
+const dealObject = z
+  .object({ hs_object_id: z.union([z.number(), z.string().regex(/^\d{1,20}$/)]) })
+  .catchall(z.unknown())
+  .refine((o) => Object.keys(o).length <= 200, { message: 'too many properties' });
 const manualTriggerSchema = z.object({
   hubId: z.string().regex(/^\d+$/),
-  payload: z.unknown(),
+  payload: z.union([dealObject, z.array(dealObject).min(1).max(1)]),
 });
 
 const probeSchema = z.object({
@@ -129,7 +151,43 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
         // receives a fully-populated object (defaults applied for missing
         // keys) — makes the form dead simple to render.
         overrides: resolveOverrides(cfg.overrides),
+        // The token itself is never returned (hash only); the URL is shown
+        // once at creation / rotation.
+        webhook_token_set: Boolean(cfg.webhookTokenHash),
+        webhook_token_created_at: cfg.webhookTokenCreatedAt?.toISOString() ?? null,
+        webhook_url_pattern: `${config.PUBLIC_BASE_URL}${webhookPath(hubIdStr, '<token>')}`,
         updated_at: cfg.updatedAt.toISOString(),
+      });
+    },
+  );
+
+  // POST /tenants/:hubId/webhook-token/rotate — mint a new URL token. The
+  // old URL stops working immediately; the plaintext is returned once.
+  app.post(
+    `${prefix}/tenants/:hubId/webhook-token/rotate`,
+    { preHandler: requireRole('tenant_admin', { hubIdParam: 'hubId' }) },
+    async (req, reply) => {
+      const { hubId: hubIdStr } = hubIdParamSchema.parse(req.params);
+      const hubId = BigInt(hubIdStr);
+      const { token, hash } = generateWebhookToken();
+      const updated = await db
+        .update(tenantConfig)
+        .set({ webhookTokenHash: hash, webhookTokenCreatedAt: new Date(), updatedAt: new Date() })
+        .where(eq(tenantConfig.hubId, hubId))
+        .returning({ hubId: tenantConfig.hubId });
+      if (updated.length === 0) return reply.code(404).send({ error: 'config_not_initialized' });
+      invalidateWebhookAllowlist(hubId);
+      await writeAdminAudit({
+        adminUserId: req.adminUser!.id,
+        action: 'tenant.webhook_token_rotate',
+        target: `hub_id=${hubIdStr}`,
+        ip: req.ip,
+      });
+      return reply.send({
+        ok: true,
+        webhook_token: token,
+        webhook_url: `${config.PUBLIC_BASE_URL}${webhookPath(hubIdStr, token)}`,
+        warning: 'Copy this URL into the HubSpot workflow now. It is not retrievable later.',
       });
     },
   );
@@ -198,8 +256,91 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
       if (body.trigger_mode !== undefined) updates.triggerMode = body.trigger_mode;
       if (body.overrides !== undefined) updates.overrides = body.overrides;
 
-      if (!existing) return reply.code(404).send({ error: 'config_not_initialized' });
+      // ---- First-time configuration: create the row -----------------------
+      // OAuth install only creates `tenants` + `oauth_tokens`; the config row
+      // is created here, from the admin UI, once the full set of required
+      // fields is supplied. A fresh webhook URL token is minted with it.
+      if (!existing) {
+        const [tenant] = await db
+          .select({ hubId: tenantsTable.hubId })
+          .from(tenantsTable)
+          .where(eq(tenantsTable.hubId, hubId))
+          .limit(1);
+        if (!tenant) return reply.code(404).send({ error: 'tenant_not_found' });
 
+        const missing: string[] = [];
+        if (!updates.phobsEndpoint) missing.push('phobs_endpoint');
+        if (!updates.phobsSiteId) missing.push('phobs_site_id');
+        if (!updates.phobsAuthUserCt) missing.push('phobs_auth_user');
+        if (!updates.phobsAuthPassCt) missing.push('phobs_auth_pass');
+        if (!updates.hubdbTableId) missing.push('hubdb_table_id');
+        if (!updates.quoteTemplateId) missing.push('quote_template_id');
+        if (updates.ownerId === undefined) missing.push('owner_id');
+        if (missing.length > 0) {
+          return reply.code(400).send({ error: 'config_incomplete', missing });
+        }
+
+        const { token, hash } = generateWebhookToken();
+        const insertRow: typeof tenantConfig.$inferInsert = {
+          hubId,
+          phobsEndpoint: updates.phobsEndpoint!,
+          phobsSiteId: updates.phobsSiteId!,
+          phobsAuthUserCt: updates.phobsAuthUserCt!,
+          phobsAuthUserIv: updates.phobsAuthUserIv!,
+          phobsAuthUserTag: updates.phobsAuthUserTag!,
+          phobsAuthPassCt: updates.phobsAuthPassCt!,
+          phobsAuthPassIv: updates.phobsAuthPassIv!,
+          phobsAuthPassTag: updates.phobsAuthPassTag!,
+          hubdbTableId: updates.hubdbTableId!,
+          hubdbColumnMap: updates.hubdbColumnMap ?? {
+            unit_id_column: 'phobs_unit_id',
+            property_id_column: 'property_id',
+          },
+          quoteTemplateId: updates.quoteTemplateId!,
+          ownerId: updates.ownerId!,
+          accessCode: null,
+          accessCodeCt: updates.accessCodeCt ?? null,
+          accessCodeIv: updates.accessCodeIv ?? null,
+          accessCodeTag: updates.accessCodeTag ?? null,
+          propertyRules: updates.propertyRules ?? {},
+          rateFilters: updates.rateFilters ?? {},
+          triggerMode: updates.triggerMode ?? 'webhook',
+          overrides: updates.overrides ?? {},
+          webhookTokenHash: hash,
+          webhookTokenCreatedAt: new Date(),
+          updatedAt: new Date(),
+        };
+        await db.insert(tenantConfig).values(insertRow);
+        const [created] = await db
+          .select()
+          .from(tenantConfig)
+          .where(eq(tenantConfig.hubId, hubId))
+          .limit(1);
+        const afterSafe = created ? redactConfig(created) : null;
+        await db.insert(tenantConfigHistory).values({
+          hubId,
+          adminUserId: req.adminUser!.id,
+          before: null,
+          after: afterSafe,
+        });
+        await writeAdminAudit({
+          adminUserId: req.adminUser!.id,
+          action: 'tenant_config.create',
+          target: `hub_id=${hubIdStr}`,
+          ip: req.ip,
+          after: afterSafe,
+        });
+        invalidateWebhookAllowlist(hubId);
+        return reply.send({
+          ok: true,
+          created: true,
+          webhook_token: token,
+          webhook_url: `${config.PUBLIC_BASE_URL}${webhookPath(hubIdStr, token)}`,
+          warning: 'Copy this URL into the HubSpot workflow now. It is not retrievable later.',
+        });
+      }
+
+      // ---- Update ---------------------------------------------------------
       // Snapshot the safe-to-log subset (no creds) for history.
       const beforeSafe = redactConfig(existing);
       await db.update(tenantConfig).set(updates).where(eq(tenantConfig.hubId, hubId));
@@ -224,8 +365,9 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
         before: beforeSafe,
         after: afterSafe,
       });
+      invalidateWebhookAllowlist(hubId);
 
-      return reply.send({ ok: true });
+      return reply.send({ ok: true, created: false });
     },
   );
 
@@ -286,7 +428,14 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
   );
 
   // POST /manual-trigger — enqueue processDeal for a hand-crafted payload
-  app.post(`${prefix}/manual-trigger`, { preHandler: requireRole('tenant_admin') }, async (req, reply) => {
+  app.post(
+    `${prefix}/manual-trigger`,
+    {
+      preHandler: requireRole('tenant_admin'),
+      bodyLimit: ADMIN_HEAVY_BODY_LIMIT,
+      config: { rateLimit: ADMIN_HEAVY_RL },
+    },
+    async (req, reply) => {
     const body = manualTriggerSchema.parse(req.body);
     const user = req.adminUser!;
     if (user.role === 'tenant_admin' && user.scopedHubId?.toString() !== body.hubId) {
@@ -306,7 +455,8 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
       after: { jobId },
     });
     return reply.send({ ok: true, jobId });
-  });
+  },
+  );
 
   // GET /workflow-action-definition — superadmin only; returns the JSON
   // definition to paste into the HubSpot dev portal (Workflow Extensions).
@@ -317,7 +467,14 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
   );
 
   // POST /phobs-probe — diagnostic; queries Phobs without mutating HubSpot
-  app.post(`${prefix}/phobs-probe`, { preHandler: requireRole('tenant_admin') }, async (req, reply) => {
+  app.post(
+    `${prefix}/phobs-probe`,
+    {
+      preHandler: requireRole('tenant_admin'),
+      bodyLimit: ADMIN_HEAVY_BODY_LIMIT,
+      config: { rateLimit: ADMIN_HEAVY_RL },
+    },
+    async (req, reply) => {
     const body = probeSchema.parse(req.body);
     const user = req.adminUser!;
     if (user.role === 'tenant_admin' && user.scopedHubId?.toString() !== body.hubId) {
@@ -394,7 +551,8 @@ export function registerAdminApiRoutes(app: FastifyInstance, prefix = '/api/admi
       rates: res.rates,
       ...(body.includeRawXml ? { rawXml: res.rawXml } : {}),
     });
-  });
+  },
+  );
 }
 
 function redactConfig(cfg: typeof tenantConfig.$inferSelect): Record<string, unknown> {

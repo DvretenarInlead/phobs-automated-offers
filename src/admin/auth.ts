@@ -15,9 +15,19 @@ declare module 'fastify' {
 const config = loadConfig();
 
 // ADMIN_IP_ALLOWLIST accepts single IPs and CIDRs (IPv4 + IPv6). Compiled
-// once at boot; invalid entries are logged by config validation upstream.
-// Empty list = no IP restriction.
+// once at boot. Empty list = no IP restriction. A list that is non-empty
+// but contains only invalid entries would lock every admin out (login
+// included) — refuse to boot instead of failing silently.
 const adminAllowlist = compileAllowlist(config.adminIpAllowlist);
+if (adminAllowlist.invalid.length > 0) {
+  console.error(
+    `ADMIN_IP_ALLOWLIST: ignoring invalid entries: ${adminAllowlist.invalid.join(', ')}`,
+  );
+}
+if (!adminAllowlist.empty && adminAllowlist.size === 0) {
+  console.error('FATAL: ADMIN_IP_ALLOWLIST is set but contains no valid IP/CIDR — every admin request would be refused.');
+  process.exit(1);
+}
 
 function ipAllowed(ip: string): boolean {
   if (adminAllowlist.empty) return true;

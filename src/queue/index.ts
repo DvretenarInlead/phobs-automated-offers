@@ -34,6 +34,26 @@ export function makeRedis(opts: RedisOpts = {}): Redis {
   return client;
 }
 
+/**
+ * Resolves once the client has emitted `ready` (or immediately if it already
+ * has); rejects after `timeoutMs`. Fail-fast clients reject commands sent
+ * before `ready`, so request-path users await this once at startup.
+ */
+export function waitForReady(client: Redis, timeoutMs = 5_000): Promise<void> {
+  if (client.status === 'ready') return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      client.off('ready', onReady);
+      reject(new Error(`redis not ready after ${timeoutMs}ms (status=${client.status})`));
+    }, timeoutMs);
+    const onReady = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    client.once('ready', onReady);
+  });
+}
+
 let queueInstance: Queue | null = null;
 export function getQueue(): Queue {
   if (!queueInstance) {

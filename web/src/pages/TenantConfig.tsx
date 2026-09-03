@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, describeError } from '../lib/api';
+import { api, ApiError, describeError } from '../lib/api';
 import { RateFiltersEditor } from '../components/RateFiltersEditor';
 import type { RateFilters } from '../components/RateFiltersEditor';
 import { CidrListEditor } from '../components/CidrListEditor';
@@ -25,6 +25,24 @@ interface ConfigResponse {
   rate_filters: Record<string, unknown>;
   trigger_mode: 'webhook' | 'workflow_extension';
   overrides: Overrides;
+  webhook_token_set: boolean;
+  webhook_token_created_at: string | null;
+  webhook_url_pattern: string;
+}
+
+interface SaveResponse {
+  ok: true;
+  created: boolean;
+  webhook_token?: string;
+  webhook_url?: string;
+  warning?: string;
+}
+
+interface RotateResponse {
+  ok: true;
+  webhook_token: string;
+  webhook_url: string;
+  warning: string;
 }
 
 interface PropertyRow {
@@ -55,7 +73,7 @@ const EMPTY_FORM: FormState = {
   phobs_endpoint: '',
   phobs_site_id: '',
   hubdb_table_id: '',
-  hubdb_column_map: {},
+  hubdb_column_map: { unit_id_column: 'phobs_unit_id', property_id_column: 'property_id' },
   quote_template_id: '',
   owner_id: '',
   trigger_mode: 'webhook',
@@ -64,6 +82,9 @@ const EMPTY_FORM: FormState = {
   access_code_new: '',
   clear_access_code: false,
 };
+
+const isNotInitialised = (err: unknown): boolean =>
+  err instanceof ApiError && err.status === 404 && err.message === 'not_found';
 
 export function TenantConfig(): ReactElement {
   const { hubId } = useParams<{ hubId: string }>();
@@ -75,7 +96,11 @@ export function TenantConfig(): ReactElement {
     // Never let a background refetch overwrite in-progress edits.
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
+    retry: (count, err) => !isNotInitialised(err) && count < 2,
   });
+
+  // A tenant that has installed the HubSpot app but has no config row yet.
+  const creating = q.isError && isNotInitialised(q.error);
 
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [rules, setRules] = useState<PropertyRow[]>([]);
@@ -85,11 +110,22 @@ export function TenantConfig(): ReactElement {
   const [dirty, setDirty] = useState(false);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [revealedUrl, setRevealedUrl] = useState<string | null>(null);
 
   // Hydrate from the server response exactly once per page load (and again
   // after our own successful save, which resets `hydrated`).
   useEffect(() => {
-    if (!q.data || hydrated) return;
+    if (hydrated) return;
+    if (creating) {
+      setForm(EMPTY_FORM);
+      setRules([]);
+      setRateFilters({});
+      setOverrides(null);
+      setHydrated(true);
+      setDirty(false);
+      return;
+    }
+    if (!q.data) return;
     setForm({
       ...EMPTY_FORM,
       phobs_endpoint: q.data.phobs_endpoint,
@@ -113,7 +149,7 @@ export function TenantConfig(): ReactElement {
     setOverrides(q.data.overrides);
     setHydrated(true);
     setDirty(false);
-  }, [q.data, hydrated]);
+  }, [q.data, creating, hydrated]);
 
   // Warn before losing unsaved edits.
   useEffect(() => {
@@ -139,6 +175,8 @@ export function TenantConfig(): ReactElement {
       return 'Phobs endpoint must be an https://…phobs.net URL.';
     }
     if (!form.phobs_site_id.trim()) return 'Site ID is required.';
+    if (creating && !form.phobs_auth_user_new) return 'Phobs username is required for a new tenant.';
+    if (creating && !form.phobs_auth_pass_new) return 'Phobs password is required for a new tenant.';
     if (!form.hubdb_table_id.trim()) return 'HubDB table ID is required.';
     if (!form.quote_template_id.trim()) return 'Quote template ID is required.';
     if (!/^\d{1,20}$/.test(form.owner_id.trim())) return 'Owner ID must be numeric.';
@@ -154,7 +192,7 @@ export function TenantConfig(): ReactElement {
   };
 
   const save = useMutation({
-    mutationFn: async (): Promise<{ ok: true }> => {
+    mutationFn: async (): Promise<SaveResponse> => {
       const localError = validateLocally();
       if (localError) throw new Error(localError);
 
@@ -200,13 +238,14 @@ export function TenantConfig(): ReactElement {
       if (form.clear_access_code) body.access_code = null;
       else if (form.access_code_new.trim()) body.access_code = form.access_code_new.trim();
 
-      return api(`/tenants/${hubId!}/config`, { method: 'PUT', body });
+      return api<SaveResponse>(`/tenants/${hubId!}/config`, { method: 'PUT', body });
     },
-    onSuccess: async () => {
+    onSuccess: async (res) => {
       setSavedAt(new Date());
       setError(null);
       setDirty(false);
       setHydrated(false); // re-hydrate from the fresh server state
+      if (res.webhook_url) setRevealedUrl(res.webhook_url);
       await qc.invalidateQueries({ queryKey: ['config', hubId] });
     },
     onError: (err) => {
@@ -214,16 +253,29 @@ export function TenantConfig(): ReactElement {
     },
   });
 
-  if (q.isPending) return <div className="text-slate-500 text-sm">Loading…</div>;
-  if (q.error) return <div className="text-rose-400 text-sm">{describeError(q.error, 'Failed to load config.')}</div>;
+  const rotate = useMutation({
+    mutationFn: (): Promise<RotateResponse> =>
+      api<RotateResponse>(`/tenants/${hubId!}/webhook-token/rotate`, { method: 'POST' }),
+    onSuccess: async (res) => {
+      setRevealedUrl(res.webhook_url);
+      setError(null);
+      await qc.invalidateQueries({ queryKey: ['config', hubId] });
+    },
+    onError: (err) => setError(describeError(err, 'rotate_failed')),
+  });
 
-  const accessCodeSet = q.data.access_code_set;
+  if (q.isPending) return <div className="text-slate-500 text-sm">Loading…</div>;
+  if (q.error && !creating) {
+    return <div className="text-rose-400 text-sm">{describeError(q.error, 'Failed to load config.')}</div>;
+  }
+
+  const accessCodeSet = q.data?.access_code_set ?? false;
 
   return (
     <div className="space-y-6">
       <header className="flex items-center justify-between sticky top-0 z-10 bg-slate-950/90 backdrop-blur py-3 -my-3">
         <div>
-          <h1 className="text-2xl font-semibold">Tenant config</h1>
+          <h1 className="text-2xl font-semibold">{creating ? 'Set up tenant' : 'Tenant config'}</h1>
           <div className="text-slate-500 text-sm font-mono">hub_id={hubId}</div>
         </div>
         <div className="flex items-center gap-3">
@@ -238,10 +290,40 @@ export function TenantConfig(): ReactElement {
             disabled={save.isPending || !hydrated}
             className="btn-primary"
           >
-            {save.isPending ? 'Saving…' : 'Save changes'}
+            {save.isPending ? 'Saving…' : creating ? 'Create configuration' : 'Save changes'}
           </button>
         </div>
       </header>
+
+      {creating && (
+        <div className="rounded border border-sky-800 bg-sky-950/30 p-3 text-sm text-sky-200">
+          This portal has installed the HubSpot app but is not configured yet. Fill in the Phobs
+          connection and HubSpot IDs below and create the configuration. The webhook URL for the
+          HubSpot workflow is generated on creation and shown once.
+        </div>
+      )}
+
+      {revealedUrl && (
+        <div className="rounded border border-amber-600/50 bg-amber-950/30 p-3">
+          <div className="text-amber-300 text-sm font-semibold mb-1">
+            Webhook URL — copy it into the HubSpot workflow now. It is not shown again.
+          </div>
+          <input
+            className="input font-mono text-xs mt-1"
+            readOnly
+            aria-label="Webhook URL"
+            value={revealedUrl}
+            onFocus={(e) => e.target.select()}
+          />
+          <div className="text-xs text-slate-400 mt-2">
+            HubSpot workflow → "Send a webhook" → POST to this URL, request signature from this
+            app, include the deal properties listed in the go-live notes.
+          </div>
+          <button type="button" className="btn-secondary text-xs mt-2" onClick={() => setRevealedUrl(null)}>
+            I have copied it
+          </button>
+        </div>
+      )}
 
       <section className="card">
         <h2 className="font-semibold mb-4">Phobs connection</h2>
@@ -263,24 +345,24 @@ export function TenantConfig(): ReactElement {
               maxLength={128}
             />
           </Field>
-          <Field label="Username (leave blank to keep)">
+          <Field label={creating ? 'Username' : 'Username (leave blank to keep)'}>
             <input
               className="input"
               autoComplete="off"
               value={form.phobs_auth_user_new}
               onChange={(e) => setField('phobs_auth_user_new', e.target.value)}
-              placeholder="••••••••"
+              placeholder={creating ? '' : '••••••••'}
               maxLength={256}
             />
           </Field>
-          <Field label="Password (leave blank to keep)">
+          <Field label={creating ? 'Password' : 'Password (leave blank to keep)'}>
             <input
               type="password"
               className="input"
               autoComplete="new-password"
               value={form.phobs_auth_pass_new}
               onChange={(e) => setField('phobs_auth_pass_new', e.target.value)}
-              placeholder="••••••••"
+              placeholder={creating ? '' : '••••••••'}
               maxLength={256}
             />
           </Field>
@@ -383,6 +465,44 @@ export function TenantConfig(): ReactElement {
         </div>
       </section>
 
+      {!creating && q.data && (
+        <section className="card">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="font-semibold">Webhook URL</h2>
+            <button
+              type="button"
+              className="btn-secondary text-xs"
+              disabled={rotate.isPending}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    'Rotate the webhook token? The current URL stops working immediately and the HubSpot workflow must be updated with the new one.',
+                  )
+                ) {
+                  rotate.mutate();
+                }
+              }}
+            >
+              {rotate.isPending ? 'Rotating…' : 'Rotate token'}
+            </button>
+          </div>
+          <p className="text-sm text-slate-400">
+            HubSpot signs webhooks with the app's shared client secret, so the URL carries a
+            per-tenant token that binds deliveries to this portal. Only the token's hash is
+            stored — the full URL is shown once, at creation or rotation.
+          </p>
+          <div className="mt-3 text-xs">
+            <span className="text-slate-500">Pattern: </span>
+            <code className="font-mono">{q.data.webhook_url_pattern}</code>
+          </div>
+          <div className="mt-1 text-xs text-slate-500">
+            {q.data.webhook_token_set
+              ? `Token issued ${q.data.webhook_token_created_at ? new Date(q.data.webhook_token_created_at).toLocaleString() : ''}`
+              : 'No token issued yet — rotate to create one.'}
+          </div>
+        </section>
+      )}
+
       <section className="card">
         <div className="flex items-center justify-between mb-4">
           <h2 className="font-semibold">Property rules (child age)</h2>
@@ -480,36 +600,40 @@ export function TenantConfig(): ReactElement {
         <RateFiltersEditor value={rateFilters} onChange={touch(setRateFilters)} />
       </section>
 
-      <section className="card">
-        <h2 className="font-semibold mb-1">Pipeline overrides</h2>
-        <p className="text-slate-500 text-xs mb-4">
-          Field mappings, quote defaults, skip conditions, loyalty trigger, SKU template and the
-          firm price-quote step — all editable without a deploy. Saved together with the rest of
-          this page.
-        </p>
-        {overrides ? (
-          <OverridesEditor value={overrides} onChange={touch(setOverrides)} />
-        ) : (
-          <div className="text-slate-500 text-sm">Loading…</div>
-        )}
-      </section>
+      {!creating && (
+        <section className="card">
+          <h2 className="font-semibold mb-1">Pipeline overrides</h2>
+          <p className="text-slate-500 text-xs mb-4">
+            Field mappings, quote defaults, skip conditions, loyalty trigger, SKU template and the
+            firm price-quote step — all editable without a deploy. Saved together with the rest of
+            this page.
+          </p>
+          {overrides ? (
+            <OverridesEditor value={overrides} onChange={touch(setOverrides)} />
+          ) : (
+            <div className="text-slate-500 text-sm">Loading…</div>
+          )}
+        </section>
+      )}
 
-      <WebhookAllowlistSection hubId={hubId!} />
+      {!creating && <WebhookAllowlistSection hubId={hubId!} />}
 
-      <section className="card">
-        <h2 className="font-semibold mb-2">API tokens</h2>
-        <p className="text-sm text-slate-400 mb-3">
-          Manage bearer tokens used by external integrations calling{' '}
-          <code className="font-mono">POST /api/trigger</code>, and their per-token IP
-          allow-lists.
-        </p>
-        <Link
-          to={`/tenants/${hubId!}/api-tokens`}
-          className="text-emerald-400 hover:text-emerald-300 text-sm"
-        >
-          Manage API tokens →
-        </Link>
-      </section>
+      {!creating && (
+        <section className="card">
+          <h2 className="font-semibold mb-2">API tokens</h2>
+          <p className="text-sm text-slate-400 mb-3">
+            Manage bearer tokens used by external integrations calling{' '}
+            <code className="font-mono">POST /api/trigger</code>, and their per-token IP
+            allow-lists.
+          </p>
+          <Link
+            to={`/tenants/${hubId!}/api-tokens`}
+            className="text-emerald-400 hover:text-emerald-300 text-sm"
+          >
+            Manage API tokens →
+          </Link>
+        </section>
+      )}
     </div>
   );
 }
@@ -574,12 +698,10 @@ function WebhookAllowlistSection({ hubId }: { hubId: string }): ReactElement {
         </div>
       </div>
       <p className="text-sm text-slate-400 mb-3">
-        Restrict which client IPs may hit{' '}
-        <code className="font-mono">POST /webhooks/hubspot/{hubId}</code> and{' '}
-        <code className="font-mono">POST /workflow-actions/process-deal</code> for this
-        tenant. HubSpot fires from AWS ranges — leave empty unless you've fronted us with a
-        fixed-IP egress proxy. HMAC/JWT verification still runs first; this is
-        defence-in-depth.
+        Restrict which client IPs may hit this tenant's webhook URL and{' '}
+        <code className="font-mono">POST /workflow-actions/process-deal</code>. HubSpot fires
+        from AWS ranges — leave empty unless you've fronted us with a fixed-IP egress proxy.
+        Signature and URL-token verification still run first; this is defence-in-depth.
       </p>
       {q.isPending ? (
         <div className="text-slate-500 text-sm">Loading…</div>
@@ -589,7 +711,7 @@ function WebhookAllowlistSection({ hubId }: { hubId: string }): ReactElement {
         <CidrListEditor
           value={cidrs}
           onChange={setCidrs}
-          emptyHint="No entries — any IP that passes HMAC/JWT is accepted."
+          emptyHint="No entries — any IP that passes signature + token checks is accepted."
         />
       )}
     </section>

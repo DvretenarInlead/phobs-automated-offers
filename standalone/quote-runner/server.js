@@ -131,10 +131,15 @@ function validatePayload(body) {
     const d = Number(body.expirationDays);
     if (!Number.isFinite(d) || d < 1 || d > 365) errors.push('expirationDays must be 1-365');
   }
-  for (const k of ['accessCode', 'lang', 'dealId', 'propertyId', 'currency', 'title']) {
-    if (body[k] !== undefined && typeof body[k] === 'string' && body[k].length > 500) {
-      errors.push(`${k} too long`);
+  // Scalars must be strings: an object here would be serialised by the XML
+  // builder as nested elements (tag-name injection into the request).
+  for (const k of ['accessCode', 'lang', 'dealId', 'propertyId', 'checkInDate', 'currency', 'title']) {
+    if (body[k] !== undefined && (typeof body[k] !== 'string' || body[k].length > 500)) {
+      errors.push(`${k} must be a string of at most 500 characters`);
     }
+  }
+  if (body.includeRestricted !== undefined && typeof body.includeRestricted !== 'boolean') {
+    errors.push('includeRestricted must be a boolean');
   }
   return errors;
 }

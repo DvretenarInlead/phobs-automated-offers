@@ -1,6 +1,6 @@
 import type { Client as HubSpotClient } from '@hubspot/api-client';
 import { callWithRetry } from '../lib/retry.js';
-import { ExternalServiceError } from '../lib/errors.js';
+import { ValidationError } from '../lib/errors.js';
 import { hubspotError } from './errors.js';
 import type { HubdbColumnMap } from '../tenancy/config.js';
 
@@ -35,10 +35,8 @@ export async function queryUnitsByPropertyId(
   const propertyColumn = map.property_id_column;
   const unitColumn = map.unit_id_column;
   if (!propertyColumn || !unitColumn) {
-    throw new ExternalServiceError(
-      'hubspot',
-      'hubdb_column_map missing property_id_column or unit_id_column',
-    );
+    // Tenant configuration problem, not an upstream one — must not be retried.
+    throw new ValidationError('hubdb_column_map missing property_id_column or unit_id_column');
   }
 
   return callWithRetry('hubspot', 'hubdb.query', async () => {

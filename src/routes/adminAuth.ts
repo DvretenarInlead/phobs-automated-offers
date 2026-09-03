@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { and, eq, isNull, lt, or } from 'drizzle-orm';
+import { and, eq, isNull, lt, or, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { adminUsers } from '../db/schema.js';
 import { logger } from '../lib/logger.js';
@@ -134,13 +134,16 @@ export function registerAdminAuthRoutes(app: FastifyInstance, prefix = '/api/adm
       if (body.recoveryCode) {
         const idx = findRecoveryMatch(user.recoveryHashes, body.recoveryCode);
         if (idx < 0) return fail('bad_mfa');
-        // Consume the recovery code
-        const remaining = user.recoveryHashes.slice();
-        remaining.splice(idx, 1);
-        await db
-          .update(adminUsers)
-          .set({ recoveryHashes: remaining })
-          .where(eq(adminUsers.id, user.id));
+        // Consume the code atomically: remove it only if it is still present,
+        // so two concurrent logins with the same code cannot both succeed.
+        const consumedHash = user.recoveryHashes[idx]!;
+        const consumed = await db.execute(sql`
+          UPDATE ${adminUsers}
+          SET recovery_hashes = array_remove(recovery_hashes, ${consumedHash})
+          WHERE id = ${user.id} AND ${consumedHash} = ANY(recovery_hashes)
+          RETURNING id
+        `);
+        if (consumed.length === 0) return fail('bad_mfa');
       } else if (body.totpCode) {
         if (!user.totpSecretCt || !user.totpSecretIv || !user.totpSecretTag) {
           throw new AuthError('totp_state_corrupt');

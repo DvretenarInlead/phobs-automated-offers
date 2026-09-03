@@ -4,7 +4,7 @@ import type { Job } from 'bullmq';
 import { and, eq, gte } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { usageDaily } from '../db/schema.js';
-import { getQueue, makeRedis, QUEUE_NAME } from '../queue/index.js';
+import { getQueue } from '../queue/index.js';
 import { requireRole } from '../admin/auth.js';
 import { writeAdminAudit } from '../admin/audit.js';
 
@@ -123,19 +123,16 @@ export function registerAdminJobsRoutes(app: FastifyInstance, prefix = '/api/adm
   // GET /queue/stats — counts of waiting/active/failed/completed. The queue
   // is shared across tenants, so the numbers are superadmin-only.
   app.get(`${prefix}/queue/stats`, { preHandler: requireRole('superadmin', { allowSuperadmin: false }) }, async (_req, reply) => {
-    const redis = makeRedis({ failFast: true });
-    try {
-      const [waiting, active, failed, completed, delayed] = await Promise.all([
-        redis.llen(`bull:${QUEUE_NAME}:wait`),
-        redis.llen(`bull:${QUEUE_NAME}:active`),
-        redis.zcard(`bull:${QUEUE_NAME}:failed`),
-        redis.zcard(`bull:${QUEUE_NAME}:completed`),
-        redis.zcard(`bull:${QUEUE_NAME}:delayed`),
-      ]);
-      return reply.send({ waiting, active, failed, completed, delayed });
-    } finally {
-      redis.disconnect();
-    }
+    // BullMQ's own connection and key layout — no throw-away client, no
+    // hand-rolled key names.
+    const counts = await getQueue().getJobCounts('wait', 'active', 'failed', 'completed', 'delayed');
+    return reply.send({
+      waiting: counts.wait ?? 0,
+      active: counts.active ?? 0,
+      failed: counts.failed ?? 0,
+      completed: counts.completed ?? 0,
+      delayed: counts.delayed ?? 0,
+    });
   });
 
   // GET /tenants/:hubId/usage?days=14 — daily rollup chart data

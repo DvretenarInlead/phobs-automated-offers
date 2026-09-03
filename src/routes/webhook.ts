@@ -13,7 +13,8 @@ import {
 import { enqueueProcessDeal } from '../queue/index.js';
 import { liveEmit } from '../lib/liveEmit.js';
 import { normaliseClientIp } from '../lib/ipAllowlist.js';
-import { loadWebhookAllowlist } from '../tenancy/webhookAllowlist.js';
+import { loadWebhookGuard } from '../tenancy/webhookAllowlist.js';
+import { verifyWebhookToken } from '../lib/webhookToken.js';
 import { writeAudit } from '../lib/audit.js';
 import {
   webhookDuplicates,
@@ -54,16 +55,29 @@ const EXTENSION_RL = { max: 120, timeWindow: '1 minute' };
 export const rateLimits = { WEBHOOK_RL, EXTENSION_RL };
 
 export function registerWebhookRoutes(app: FastifyInstance): void {
-  // Route A: "Send a webhook" workflow action, HMAC v3.
-  app.post<{ Params: { portalId: string } }>(
-    '/webhooks/hubspot/:portalId',
+  // Route A: "Send a webhook" workflow action, HMAC v3 + per-tenant URL token.
+  //
+  // Three checks, in order:
+  //   1. HMAC v3 over method + full URI + body + timestamp with the app's
+  //      client secret → the request really came from HubSpot (for *some*
+  //      portal the app is installed on).
+  //   2. The URL token matches the tenant named by :portalId → the request
+  //      came from a workflow configured by *this* tenant's admin. Without
+  //      this, any installed portal could deliver signed requests to another
+  //      tenant's endpoint (the client secret is shared across portals).
+  //   3. Optional per-tenant IP allow-list.
+  app.post<{ Params: { portalId: string; token: string } }>(
+    '/webhooks/hubspot/:portalId/:token',
     {
       config: { rawBody: true, rateLimit: WEBHOOK_RL },
       schema: {
         params: {
           type: 'object',
-          required: ['portalId'],
-          properties: { portalId: { type: 'string', pattern: '^[0-9]{1,20}$' } },
+          required: ['portalId', 'token'],
+          properties: {
+            portalId: { type: 'string', pattern: '^[0-9]{1,20}$' },
+            token: { type: 'string', pattern: '^[A-Za-z0-9_-]{32,64}$' },
+          },
         },
       },
     },
@@ -95,13 +109,34 @@ export function registerWebhookRoutes(app: FastifyInstance): void {
           { hubId: portalId.toString(), reason: verdict.reason, requestId: req.requestId },
           'webhook signature verification failed',
         );
+        // Opaque to callers — logs + metrics carry the reason.
         return reply.code(401).send({ error: 'unauthorized' });
       }
 
-      // Per-tenant IP allow-list (defence-in-depth after HMAC). Empty list =
-      // no restriction. HubSpot fires from AWS ranges; leave empty unless
-      // you're locking down to a specific egress proxy.
-      if (!(await checkTenantIp(portalId, req, 'webhook'))) {
+      const guard = await loadWebhookGuard(portalId);
+      if (!verifyWebhookToken(req.params.token, guard.tokenHash)) {
+        webhookSignatureFailures.labels('webhook', 'bad_token').inc();
+        liveEmit('webhooks', portalId, {
+          ts: Date.now(),
+          type: 'token_denied',
+          hubId: portalId.toString(),
+        });
+        logger.warn(
+          { hubId: portalId.toString(), requestId: req.requestId, ip: req.ip },
+          'webhook URL token rejected (signed by HubSpot, but not this tenant’s token)',
+        );
+        await writeAudit({
+          hubId: portalId,
+          requestId: req.requestId,
+          kind: 'webhook.token_denied',
+          status: 'error',
+          request: { ip: normaliseClientIp(req.ip) },
+          error: 'bad_token',
+        });
+        return reply.code(401).send({ error: 'unauthorized' });
+      }
+
+      if (!(await checkTenantIp(portalId, req, 'webhook', guard.allowlist))) {
         return reply.code(403).send({ error: 'ip_not_allowed' });
       }
 
@@ -115,7 +150,8 @@ export function registerWebhookRoutes(app: FastifyInstance): void {
     },
   );
 
-  // Route B: Workflow Extension (custom action), JWT.
+  // Route B: Workflow Extension (custom action), JWT. The hub id comes from
+  // a claim in HubSpot's signed JWT, so it is already bound to the portal.
   app.post(
     '/workflow-actions/process-deal',
     { config: { rawBody: true, rateLimit: EXTENSION_RL } },
@@ -136,8 +172,8 @@ export function registerWebhookRoutes(app: FastifyInstance): void {
       }
       if (!hubId) return reply.code(400).send({ error: 'missing_hub_id_claim' });
 
-      // Per-tenant IP allow-list after JWT verification.
-      if (!(await checkTenantIp(hubId, req, 'extension'))) {
+      const guard = await loadWebhookGuard(hubId);
+      if (!(await checkTenantIp(hubId, req, 'extension', guard.allowlist))) {
         return reply.code(403).send({ error: 'ip_not_allowed' });
       }
 
@@ -161,8 +197,8 @@ async function checkTenantIp(
   hubId: bigint,
   req: FastifyRequest,
   source: 'webhook' | 'extension',
+  allowlist: Awaited<ReturnType<typeof loadWebhookGuard>>['allowlist'],
 ): Promise<boolean> {
-  const allowlist = await loadWebhookAllowlist(hubId);
   if (allowlist.empty) return true;
   const ip = normaliseClientIp(req.ip);
   if (allowlist.contains(ip)) return true;
@@ -199,6 +235,8 @@ interface AcceptInput {
 async function handleAccepted(app: FastifyInstance, reply: FastifyReply, input: AcceptInput) {
   const parsed = HubSpotPayload.safeParse(input.body);
   if (!parsed.success) {
+    // Log the shape server-side; don't echo it to the caller (it'd help
+    // attackers probe the accepted payload schema).
     app.log.warn(
       { hubId: input.hubId.toString(), detail: parsed.error.format() },
       'webhook rejected: invalid payload',
@@ -207,7 +245,12 @@ async function handleAccepted(app: FastifyInstance, reply: FastifyReply, input: 
   }
   const first = Array.isArray(parsed.data) ? parsed.data[0]! : parsed.data;
   const dealIdRaw = first.hs_object_id;
-  const dealId = typeof dealIdRaw === 'string' ? BigInt(dealIdRaw) : BigInt(dealIdRaw);
+  let dealId: bigint;
+  try {
+    dealId = BigInt(dealIdRaw);
+  } catch {
+    return reply.code(400).send({ error: 'invalid_payload' });
+  }
 
   const idemKey = idempotencyKeyFor(input.hubId, dealId, input.rawBody);
 

@@ -30,7 +30,7 @@ against your real HubSpot portal, Phobs account and DigitalOcean project.
      are unverified against a live HubSpot custom action — treat it as beta.
 
 2. **DigitalOcean App Platform**
-   - `doctl apps create --spec .do/app.yaml` (Postgres 16 + Redis 7 managed).
+   - `doctl apps create --spec .do/app.yaml` (managed Postgres 17 + Valkey 8, the Redis-compatible engine DO offers now).
    - Set SECRET envs on **web and worker**: `TOKEN_VAULT_KEY`, `SESSION_SECRET`
      (32 random bytes, base64 — see README), `HUBSPOT_CLIENT_ID/_SECRET/_APP_ID`;
      optional `METRICS_TOKEN`. Leave `TOKEN_VAULT_KEY_PREV` empty.

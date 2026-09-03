@@ -66,7 +66,7 @@ async function main(): Promise<void> {
   const PAGE = 500;
   const states = ['completed', 'failed', 'delayed', 'waiting', 'active', 'paused'] as const;
   const payloadDealId = (raw: unknown): string | null => {
-    const item = Array.isArray(raw) ? raw[0] : raw;
+    const item: unknown = Array.isArray(raw) ? (raw as unknown[])[0] : raw;
     if (!item || typeof item !== 'object') return null;
     const v = (item as Record<string, unknown>).hs_object_id;
     return typeof v === 'number' || typeof v === 'string' || typeof v === 'bigint' ? String(v) : null;

@@ -80,7 +80,34 @@ let cached: AppConfig | null = null;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (cached) return cached;
-  const parsed = envSchema.parse(env);
+  const result = envSchema.safeParse(env);
+  if (!result.success) {
+    // A Zod dump is hard to read in platform logs. Print one line per
+    // problem and the most common cause, then exit — nothing can run.
+    const lines = result.error.issues.map((i) => {
+      const key = i.path.join('.');
+      const raw = env[key];
+      const hint =
+        raw === undefined
+          ? 'missing'
+          : /^\$\{.+\}$/.test(raw)
+            ? `unresolved placeholder ${raw} (component name in app.yaml does not match)`
+            : i.message;
+      return `  - ${key}: ${hint}`;
+    });
+    console.error(
+      [
+        'FATAL: environment is incomplete or invalid:',
+        ...lines,
+        '',
+        'On DigitalOcean App Platform the env block, worker and migrate job come from',
+        '.do/app.yaml — apply it (App → Settings → App Spec, or `doctl apps update <id> --spec .do/app.yaml`)',
+        'and set the SECRET values on each component. See GO-LIVE.md §1.2.',
+      ].join('\n'),
+    );
+    process.exit(1);
+  }
+  const parsed = result.data;
   cached = {
     ...parsed,
     tokenVaultKey: Buffer.from(parsed.TOKEN_VAULT_KEY, 'base64'),
